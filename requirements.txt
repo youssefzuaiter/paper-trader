@@ -1,0 +1,28 @@
+# --- Phase 1: core service ---
+fastapi>=0.115
+uvicorn[standard]>=0.32
+pydantic>=2.9
+
+# --- Broker (Alpaca paper/sandbox only) ---
+alpaca-py>=0.33
+
+# broker.py's WebSocket trade_updates stream builds its own TLS context
+# from certifi's CA bundle — the `websockets` library (unlike httpx) does
+# not locate a CA bundle automatically on every machine. Already an
+# indirect dependency of alpaca-py/httpx; pinned directly now that
+# broker.py imports it itself.
+certifi>=2024.0.0
+
+# --- Phase 4: signed webhook delivery ---
+httpx>=0.27
+
+# --- Phase 2: inference runtime ---
+torch>=2.4
+
+# Credential loading for broker.py / webhook.py. Not in the original list, but
+# `.env` loading is a hard requirement of Phase 1 and stdlib has no equivalent.
+python-dotenv>=1.0
+
+# NOTE: `transformers` is deliberately absent. inference.py ships a deterministic
+# torch placeholder; add `transformers>=4.44` only when swapping in the real
+# ProsusAI/finbert checkpoint (see inference.py::_load_model).

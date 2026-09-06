@@ -1,0 +1,219 @@
+# Tier-0 Paper Trading Agent
+
+Sandbox-only equities agent. Sentiment inference gated by a deterministic
+execution layer, with HMAC-signed trade receipts pushed to the PFW Next.js
+dashboard.
+
+**Nothing here can touch real money.** `broker.py` hardcodes `paper=True` as a
+module-level `Final`, and re-asserts after construction that the resolved client
+points at `https://paper-api.alpaca.markets` with `sandbox=True`. There is no
+code path that builds a live `TradingClient`.
+
+Everything in the stack is free: Alpaca paper accounts, `alpaca-py`, and the
+FinBERT checkpoint (`ProsusAI/finbert`, MIT) all cost nothing, and market data is
+simulated so no data subscription is required.
+
+---
+
+## Setup
+
+```bash
+python3 -m venv .venv
+./.venv/bin/pip install -r requirements.txt
+cp .env.example .env      # then fill in ALPACA_* from the paper dashboard
+./.venv/bin/uvicorn main:app --reload --port 8000
+```
+
+Paper keys: <https://app.alpaca.markets/paper/dashboard/overview> → *API Keys*.
+`WEBHOOK_SECRET` is pre-generated in `.env`; copy that same value into PFW.
+
+---
+
+## Module map
+
+| File | Phase | Responsibility |
+|------|-------|----------------|
+| `config.py`    | 1 | `BrokerSettings` + `WebhookSettings`, validated independently. |
+| `broker.py`    | 1 | Alpaca `TradingClient`, sandbox enforced structurally. |
+| `inference.py` | 2 | Simulated quotes/news + FinBERT-shaped async inference. |
+| `execution.py` | 3 | Tier-0 gates, sizing, order construction, submission. |
+| `webhook.py`   | 4 | Canonical JSON receipt, HMAC-SHA256, `httpx` delivery. |
+| `main.py`      | 1 | FastAPI app, lifespan, HTTP surface. |
+
+---
+
+## Settings are split by trust boundary
+
+`config.py` exposes two Pydantic models that validate **independently**:
+
+| Model | Holds | Needed for |
+|-------|-------|-----------|
+| `BrokerSettings` | `ALPACA_API_KEY_ID`, `ALPACA_API_SECRET_KEY`, pinned `base_url` | *Placing* an order |
+| `WebhookSettings` | `WEBHOOK_SECRET`, `WEBHOOK_URL`, `USD_ILS_RATE` | *Delivering* a receipt |
+
+This is not tidiness. A single all-or-nothing settings object meant a
+missing `ALPACA_API_KEY_ID` raised while merely *building a receipt* —
+blocking the one path that has no business touching the broker. Signing a
+receipt for a fill that already happened must not depend on credentials for
+placing a new one.
+
+So the service boots and serves the full receipt path with no Alpaca
+credentials at all. `GET /health` reports `broker_configured` and
+`webhook_configured` separately; `/signals/execute` and `/account` return
+`503` naming the exact missing variables, and nothing else is affected.
+
+`BrokerSettings.base_url` is present but **never read from the
+environment** — it is pinned to the paper host by a validator that rejects
+the live one. Phase 1 made sandbox execution structural; routing it through
+`.env` would hand it back to whoever can edit that file.
+
+---
+
+## API
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET`  | `/health` | Liveness + active Tier-0 limits. No credentials needed. |
+| `GET`  | `/account` | Paper account snapshot. |
+| `POST` | `/signals/evaluate` | **Dry run.** Ingest → infer → gate. Submits nothing. |
+| `POST` | `/signals/execute` | Full pipeline, including order + receipt. |
+| `GET`  | `/docs` | OpenAPI UI. |
+
+```bash
+curl -X POST localhost:8000/signals/evaluate \
+  -H 'Content-Type: application/json' \
+  -d '{"ticker":"NVDA","headline":"NVDA beats estimates and raises full-year guidance"}'
+```
+
+Omit `headline` to pull one from the simulated feed. A Tier-0 rejection is a
+normal `200` with `approved: false` — the engine declining to trade is an
+expected outcome, not an error.
+
+---
+
+## Tier-0 rules
+
+Hardcoded `Final` constants in `execution.py`. They are deliberately **not**
+environment-configurable and not reachable from any request body — a limit a
+caller can widen is not a limit.
+
+| Constant | Value | Effect |
+|----------|-------|--------|
+| `MIN_PREDICTED_GAIN_PCT` | `10` | Reject any signal predicting `< +10%`. |
+| `MAX_NOTIONAL_USD` | `10` | Hard cap on per-order exposure. |
+| `STOP_LOSS_PCT` | `5` | Stop distance below the entry limit. |
+| `LIMIT_BUFFER_PCT` | `0.25` | Marketable-limit buffer above the ask. |
+
+Sizing is `Decimal` throughout with explicit rounding modes — entry rounds **up**,
+stop rounds **down**, quantity rounds **down** — so rounding can only ever tighten
+risk. A post-condition re-checks the notional against the cap and suppresses the
+order if it fails. The single `float` cast happens at the Alpaca API boundary.
+
+### Constraint: fractional orders cannot carry a broker-side stop
+
+Alpaca's server rejects the `bracket` / `OCO` / `OTO` order classes on fractional
+quantities. With a $10 cap, almost every liquid symbol sizes fractionally, so
+both branches are live. `_choose_stop_strategy` takes the strongest stop the
+broker will actually accept:
+
+| Sizing | `stop_loss_kind` | Behaviour |
+|--------|------------------|-----------|
+| Whole shares (≥ 1, integral) | `native_oto` | Real resting stop child order at Alpaca. |
+| Fractional | `engine_tracked` | Broker cannot hold it; stop price is computed, logged at `WARNING`, and carried on the receipt. |
+
+The stop is **never silently dropped** — but on the fractional path it is not yet
+enforced. Closing that gap needs a position monitor that polls marks and submits
+the exit; that does not exist yet and is the highest-value next piece of work.
+
+---
+
+## Webhook contract
+
+`POST {WEBHOOK_URL}` → `http://localhost:3000/api/webhooks/trades`
+
+| Header | Value |
+|--------|-------|
+| `X-Signature-Timestamp` | Unix seconds |
+| `X-Signature-256` | `sha256=<hex digest>` |
+| `X-Idempotency-Key` | Mirrors `idempotency_key` in the body |
+
+Signed material is `f"{timestamp}." + body` (Stripe's scheme) — binding the
+timestamp into the MAC is what makes a captured receipt un-replayable.
+
+Two invariants worth preserving if you edit `webhook.py`:
+
+1. **Sign the bytes you send.** The body is serialised once (sorted keys, no
+   whitespace) and passed to `httpx` as `content=`, never `json=`. Handing httpx
+   a dict lets it re-serialise, and the digest would stop describing the
+   transmitted bytes.
+2. **Money crosses the wire as integers.** Minor units (cents / agorot) as JSON
+   integers; share quantities and FX rates as decimal *strings*. PFW stores these
+   as `BigInt` and `Decimal(30, 18)`; a JSON float round-trip corrupts both.
+
+Field names mirror PFW's `Trade` model so the route can persist without a
+translation layer:
+
+```json
+{
+  "schema_version": 1,
+  "idempotency_key": "3f0b59a7a419432885e2abb8e6eca9a7",
+  "broker": "alpaca", "environment": "paper",
+  "order_id": "...", "client_order_id": "...", "order_status": "accepted",
+  "symbol": "NVDA", "side": "buy", "quantity": "0.082236842",
+  "currency": "USD",
+  "native_price_amount": 12160, "native_total_amount": 1000,
+  "exchange_rate_at_entry": "3.700000",
+  "price_agorot": 44992, "total_agorot": 3700,
+  "limit_price": "121.60", "stop_price": "115.52",
+  "stop_loss_kind": "engine_tracked",
+  "executed_at": "2026-09-05T11:24:27Z",
+  "signal": { "model_name": "...", "predicted_move_pct": 11.9592,
+              "confidence": 0.874027, "headline": "..." }
+}
+```
+
+Receiving side — read the **raw** body before any JSON parsing, or the digest
+will not match:
+
+```ts
+import { createHmac, timingSafeEqual } from "node:crypto";
+
+const raw = await req.text();                       // raw bytes, not req.json()
+const ts  = req.headers.get("x-signature-timestamp") ?? "";
+const sig = (req.headers.get("x-signature-256") ?? "").replace("sha256=", "");
+
+if (Math.abs(Date.now() / 1000 - Number(ts)) > 300) return new Response(null, { status: 401 });
+
+const expected = createHmac("sha256", process.env.WEBHOOK_SECRET!)
+  .update(`${ts}.${raw}`)
+  .digest("hex");
+
+const a = Buffer.from(expected), b = Buffer.from(sig);
+if (a.length !== b.length || !timingSafeEqual(a, b)) return new Response(null, { status: 401 });
+```
+
+Delivery never raises: the trade has already executed, so a webhook failure is
+reported as structured status rather than unwinding the order. Retries replay the
+same bytes and signature, and `idempotency_key` lets the receiver dedupe.
+
+---
+
+## What is a placeholder
+
+`inference.py` ships a fixed-weight `torch.nn.Module` over a SHA-256
+pseudo-embedding, plus a small lexical prior so the stub behaves intelligibly
+during development. It has the real model's contract — 3-class logits in
+ProsusAI/finbert's label order (`0=positive, 1=negative, 2=neutral`), softmax,
+blocking forward dispatched through `asyncio.to_thread` so a CPU-bound
+transformer never stalls the event loop.
+
+Output is **deterministic in `(ticker, headline)`**. A Tier-0 engine whose
+upstream signal is random is untestable: the same headline must always produce
+the same order.
+
+To swap in the real model: `pip install transformers`, replace the body of
+`_load_model`, and tokenise in `_embed` instead of hashing. Nothing downstream of
+`predict_move` changes.
+
+Also simulated: quotes (`fetch_quote`) and the news feed
+(`fetch_latest_headline`), both deterministic with time-based drift.
