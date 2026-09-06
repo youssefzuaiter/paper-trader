@@ -16,7 +16,8 @@ certifi>=2024.0.0
 # --- Phase 4: signed webhook delivery ---
 httpx>=0.27
 
-# --- Phase 2: inference runtime ---
+# --- Phase 2: inference runtime; also backs models/autoencoder.py's
+# genuinely-trained cash-flow anomaly detector (Phase 3, ad hoc) ---
 torch>=2.4
 
 # Credential loading for broker.py / webhook.py. Not in the original list, but

@@ -1,0 +1,8 @@
+{
+  "amount_log_mean": 3.3389458848559213,
+  "amount_log_std": 0.7799107003041741,
+  "mean_normal_mse": 0.11768302321434021,
+  "std_normal_mse": 0.045085322111845016,
+  "z_threshold": 2.5,
+  "trained_on": "synthetic"
+}

@@ -19,11 +19,12 @@ import logging
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 import broker
 import execution
@@ -36,6 +37,7 @@ from config import (
     get_webhook_settings,
     is_autonomous_mode_enabled,
 )
+from models import autoencoder
 from scheduler import (
     agent_telemetry,
     trading_loop,
@@ -316,6 +318,88 @@ async def halt(request: Request) -> dict[str, Any]:
 
     logger.critical("Emergency halt: %d open order(s) canceled", canceled_count)
     return {"halted": True, "orders_canceled": canceled_count}
+
+
+class TransactionAnalysisRequest(BaseModel):
+    """One transaction to score for cash-flow anomaly (Phase 3, ad hoc).
+
+    ``occurred_at`` should be timezone-aware; the hour fed into the
+    autoencoder is derived from it directly rather than accepted as a
+    separate raw-integer field, since a caller-supplied bare hour with no
+    timezone context is genuinely ambiguous in a way a full timestamp
+    isn't. ``amount`` is the transaction's absolute value in the
+    currency's MAJOR unit (dollars/shekels, not cents/agorot) — this
+    service has no currency-conversion concerns of its own here, unlike
+    its trading side; the caller's own currency is whatever it already
+    reports amounts in.
+    """
+
+    transaction_id: str = Field(
+        ..., min_length=1, description="Caller's own id, echoed back for correlation only — never looked up here."
+    )
+    amount: float
+    category: str = Field(..., min_length=1, max_length=80)
+    occurred_at: datetime
+
+
+@app.post("/analyze/transaction", tags=["analytics"])
+async def analyze_transaction(request: Request) -> dict[str, Any]:
+    """Cash-flow anomaly check for one transaction (Phase 3, ad hoc).
+
+    Same inbound HMAC trust boundary as ``/control/halt`` above —
+    identical shared ``WEBHOOK_SECRET``, identical replay window, no new
+    secret needed. The expected caller is PFW's own server, signing this
+    request the same way it signs the halt request, after it has already
+    resolved which user's transaction this is; this endpoint never sees a
+    PFW user id or session, only the transaction fields it needs to score
+    (see ``TransactionAnalysisRequest``) — it has no way to look up
+    anything about the caller's account even if it wanted to.
+
+    Runs the transaction through ``models.autoencoder``'s trained
+    checkpoint (see that module and ``train_autoencoder.py`` for the
+    model itself and how its Z-score threshold was derived) and returns
+    whether its reconstruction error clears that threshold.
+    """
+    raw_body = await request.body()
+    timestamp = request.headers.get(webhook.TIMESTAMP_HEADER)
+    signature = request.headers.get(webhook.SIGNATURE_HEADER)
+
+    try:
+        settings = get_webhook_settings()
+    except ConfigError as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+
+    if not timestamp or not signature:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Missing signature headers")
+
+    try:
+        timestamp_seconds = int(timestamp)
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid timestamp") from exc
+
+    if abs(time.time() - timestamp_seconds) > _CONTROL_REPLAY_WINDOW_SECONDS:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Stale signature")
+
+    if not webhook.verify(raw_body, timestamp, signature, settings.secret):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid signature")
+
+    try:
+        payload = TransactionAnalysisRequest.model_validate_json(raw_body)
+    except ValidationError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc.errors())) from exc
+
+    try:
+        result = autoencoder.score_transaction(payload.amount, payload.category, payload.occurred_at.hour)
+    except FileNotFoundError as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+
+    return {
+        "transaction_id": payload.transaction_id,
+        "is_anomaly": result.is_anomaly,
+        "reconstruction_error": result.reconstruction_error,
+        "z_score": result.z_score,
+        "threshold": result.threshold,
+    }
 
 
 async def _resolve_ticker_and_headline(request: SignalRequest) -> tuple[str, str]:

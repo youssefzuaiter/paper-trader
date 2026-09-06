@@ -77,6 +77,7 @@ the live one. Phase 1 made sandbox execution structural; routing it through
 | `GET`  | `/account` | Paper account snapshot. |
 | `POST` | `/signals/evaluate` | **Dry run.** Ingest → infer → gate. Submits nothing. |
 | `POST` | `/signals/execute` | Full pipeline, including order + receipt. |
+| `POST` | `/analyze/transaction` | Cash-flow anomaly check (Phase 3, ad hoc) — HMAC-verified inbound, same trust boundary as `/control/halt`. See [Cash-flow anomaly detection](#cash-flow-anomaly-detection). |
 | `GET`  | `/docs` | OpenAPI UI. |
 
 ```bash
@@ -195,6 +196,36 @@ if (a.length !== b.length || !timingSafeEqual(a, b)) return new Response(null, {
 Delivery never raises: the trade has already executed, so a webhook failure is
 reported as structured status rather than unwinding the order. Retries replay the
 same bytes and signature, and `idempotency_key` lets the receiver dedupe.
+
+---
+
+## Cash-flow anomaly detection
+
+`models/autoencoder.py` is a lightweight PyTorch autoencoder (11 input
+features: log-normalized amount, cyclical hour-of-day, one-hot category)
+that flags a single transaction as anomalous by how badly it reconstructs
+— the standard autoencoder-anomaly-detection paradigm, trained only on
+synthetic "normal" traffic (`models/train_autoencoder.py`; there is no
+real transaction history here to train against — this service has no
+database connection to PFW's ledger at all). `POST /analyze/transaction`
+runs a transaction through it and compares the reconstruction MSE against
+a Z-score threshold derived at training time from a held-out normal
+validation set's own error distribution (default `z > 2.5`).
+
+Unlike `/signals/*`, this is genuinely trained, not a placeholder (see
+below) — an untrained model's threshold would be statistically
+meaningless, and `is_anomaly: true` is a direct, user-facing flag against
+someone's own financial data, not an internal trading signal sitting
+behind separate hard-coded safety caps. Retrain with
+`python -m models.train_autoencoder` if the category vocabulary
+(`CATEGORY_VOCAB` in `models/autoencoder.py`) ever changes — training and
+inference share that constant so the two can't silently drift apart.
+
+Same inbound HMAC trust boundary as `/control/halt`: the caller (PFW's
+own server) signs the request with the shared `WEBHOOK_SECRET`, verified
+here via `webhook.verify()`. No new secret needed. This endpoint has no
+way to look up anything about the caller's account — it only ever sees
+the transaction fields in the request body.
 
 ---
 
