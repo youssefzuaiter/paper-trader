@@ -1,0 +1,5 @@
+# Dev/test-only dependencies (not needed to run the service):
+#   ./.venv/bin/pip install -r requirements-dev.txt
+#   ./.venv/bin/pytest
+pytest>=8.0
+pytest-asyncio>=0.24

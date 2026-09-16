@@ -30,6 +30,8 @@ import broker
 import execution
 import inference
 import webhook
+from outbox import default_outbox
+from reconcile import reconcile_loop, reconcile_recent_fills
 from config import (
     ConfigError,
     broker_is_configured,
@@ -39,7 +41,9 @@ from config import (
 )
 from models import autoencoder
 from scheduler import (
+    _log_event,
     agent_telemetry,
+    run_signal_cycle,
     trading_loop,
     trigger_emergency_halt,
     websocket_settlement_stream,
@@ -127,7 +131,28 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     logger.info("Starting background websocket_settlement_stream()")
     settlement_task = asyncio.create_task(websocket_settlement_stream())
 
+    # Durable outbox (see outbox.py): re-signs and replays any receipt
+    # PFW never acknowledged. Runs unconditionally, like the settlement
+    # stream — a queued receipt from a manual /signals/execute needs
+    # delivering just as much as one from the autonomous loop.
+    logger.info("Starting background outbox.replay_loop() (%d pending)", default_outbox.pending_count())
+    outbox_task = asyncio.create_task(default_outbox.replay_loop(webhook.send_once))
+
+    # Reconciliation against Alpaca's order history (see reconcile.py):
+    # one pass shortly after startup, then hourly. Closes the gap the
+    # outbox can't — a settlement this process THOUGHT was delivered, or
+    # never generated at all.
+    logger.info("Starting background reconcile_loop()")
+    reconcile_task = asyncio.create_task(reconcile_loop(on_recovered=_telemetry_for_recovered_fill))
+
     yield
+
+    for task in (reconcile_task, outbox_task):
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
     if autonomous_task is not None:
         autonomous_task.cancel()
@@ -201,6 +226,9 @@ async def health() -> dict[str, Any]:
         # discover by getting a 503 from /signals/execute.
         "broker_configured": broker_is_configured(),
         "webhook_configured": _webhook_is_configured(),
+        # Receipts queued for replay because PFW never acknowledged them
+        # (outbox.py). PFW's dashboard badge surfaces a non-zero count.
+        "outbox_pending": default_outbox.pending_count(),
         "model": inference.MODEL_NAME,
         "tier0_limits": {
             "min_predicted_gain_pct": str(execution.MIN_PREDICTED_GAIN_PCT),
@@ -261,6 +289,74 @@ async def positions() -> list[dict[str, str]]:
 _CONTROL_REPLAY_WINDOW_SECONDS = 300
 
 
+def _telemetry_for_recovered_fill(order: Any) -> None:
+    """Surface a reconciliation recovery on the Agent Activity page like a live settlement."""
+    _log_event(
+        "settle",
+        ticker=str(order.symbol),
+        status="settled (reconciled)",
+        details=f"Recovered fill {order.filled_qty} @ {order.filled_avg_price} (order {order.id}, via reconciliation)",
+    )
+
+
+async def _verify_control_request(request: Request) -> bytes:
+    """The shared trust boundary for every ``/control/*`` endpoint: an
+    HMAC-SHA256 signature over the raw request body, the exact same
+    scheme (and the exact same shared ``WEBHOOK_SECRET``) this service
+    already uses to SIGN its own outbound receipts to PFW — verified here
+    in the reverse direction. The caller is PFW's own server, which signs
+    after confirming the browser holds an authenticated PFW session; the
+    browser itself never sees ``WEBHOOK_SECRET``, since embedding a shared
+    HMAC secret in client-side JavaScript would hand anyone who opens dev
+    tools the ability to forge trade receipts and settlements too. Raises
+    the appropriate ``HTTPException``; returns the verified raw body.
+    """
+    raw_body = await request.body()
+    # Starlette's Headers is case-insensitive by construction, matching
+    # HTTP's own header-name semantics — no need to normalize case here.
+    timestamp = request.headers.get(webhook.TIMESTAMP_HEADER)
+    signature = request.headers.get(webhook.SIGNATURE_HEADER)
+
+    try:
+        settings = get_webhook_settings()
+    except ConfigError as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+
+    if not timestamp or not signature:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Missing signature headers")
+    try:
+        timestamp_seconds = int(timestamp)
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid timestamp") from exc
+    if abs(time.time() - timestamp_seconds) > _CONTROL_REPLAY_WINDOW_SECONDS:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Stale signature")
+
+    if not webhook.verify(raw_body, timestamp, signature, settings.secret):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid signature")
+    return raw_body
+
+
+class ReconcileRequest(BaseModel):
+    lookback_hours: int = Field(default=24, ge=1, le=24 * 30)
+
+
+@app.post("/control/reconcile", tags=["control"])
+async def reconcile(request: Request) -> dict[str, Any]:
+    """Re-send the settlement receipt for every fill Alpaca reports in the
+    lookback window (see ``reconcile.py``). Idempotent on the PFW side, so
+    safe to call at any time; same HMAC trust boundary as ``/control/halt``.
+    """
+    raw_body = await _verify_control_request(request)
+    try:
+        params = ReconcileRequest.model_validate_json(raw_body or b"{}")
+    except ValidationError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, exc.errors()) from exc
+    stats = await reconcile_recent_fills(
+        lookback_hours=params.lookback_hours, on_recovered=_telemetry_for_recovered_fill,
+    )
+    return {"ok": stats.error is None, **stats.__dict__}
+
+
 @app.post("/control/halt", tags=["control"])
 async def halt(request: Request) -> dict[str, Any]:
     """Emergency kill switch.
@@ -281,30 +377,7 @@ async def halt(request: Request) -> dict[str, Any]:
     require a deliberate restart of this process to clear, not an easy
     accidental toggle back on.
     """
-    raw_body = await request.body()
-    # Starlette's Headers is case-insensitive by construction, matching
-    # HTTP's own header-name semantics — no need to normalize case here.
-    timestamp = request.headers.get(webhook.TIMESTAMP_HEADER)
-    signature = request.headers.get(webhook.SIGNATURE_HEADER)
-
-    try:
-        settings = get_webhook_settings()
-    except ConfigError as exc:
-        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
-
-    if not timestamp or not signature:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Missing signature headers")
-
-    try:
-        timestamp_seconds = int(timestamp)
-    except ValueError as exc:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid timestamp") from exc
-
-    if abs(time.time() - timestamp_seconds) > _CONTROL_REPLAY_WINDOW_SECONDS:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Stale signature")
-
-    if not webhook.verify(raw_body, timestamp, signature, settings.secret):
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid signature")
+    await _verify_control_request(request)
 
     trigger_emergency_halt("Emergency halt triggered via POST /control/halt")
 
@@ -417,29 +490,13 @@ async def evaluate(request: SignalRequest) -> dict[str, Any]:
     """Dry run: ingest, infer and apply the Tier-0 gates. Submits nothing.
 
     Use this to inspect what the engine *would* do. It needs no credentials.
+    Runs through the SAME ``scheduler.run_signal_cycle`` pipeline as the
+    autonomous loop (``submit=False``), so the evaluation shows up in the
+    telemetry feed and in PFW's ``ScenarioMetrics`` like any other —
+    previously a manual call was invisible to both.
     """
     ticker, headline = await _resolve_ticker_and_headline(request)
-    quote = await inference.fetch_quote(ticker)
-    signal = await inference.predict_move(ticker, headline)
-
-    payload: dict[str, Any] = {
-        "signal": signal.model_dump(mode="json"),
-        "quote": {
-            "bid": str(quote.bid),
-            "ask": str(quote.ask),
-            "as_of": quote.as_of.isoformat(),
-        },
-    }
-
-    try:
-        plan = execution.validate_and_plan(signal, quote)
-    except execution.Tier0Rejection as rejection:
-        return payload | {
-            "approved": False,
-            "rejection": {"code": rejection.code.value, "detail": rejection.detail},
-        }
-
-    return payload | {"approved": True, "plan": plan.as_dict()}
+    return await run_signal_cycle(ticker, headline, submit=False)
 
 
 @app.post("/signals/execute", tags=["trading"])
@@ -447,14 +504,13 @@ async def execute(request: SignalRequest) -> dict[str, Any]:
     """Full pipeline: ingest -> infer -> Tier-0 gate -> paper order -> receipt.
 
     A rejected signal is a normal 200 response with ``executed: false`` — the
-    engine declining to trade is an expected outcome, not an error.
+    engine declining to trade is an expected outcome, not an error. Same
+    ``scheduler.run_signal_cycle`` pipeline as the autonomous loop, so the
+    telemetry/metrics side effects are identical to an autonomous cycle.
     """
     ticker, headline = await _resolve_ticker_and_headline(request)
-    quote = await inference.fetch_quote(ticker)
-    signal = await inference.predict_move(ticker, headline)
-
     try:
-        return await execution.execute_signal(signal, quote)
+        return await run_signal_cycle(ticker, headline, submit=True)
     except ConfigError as exc:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
     except Exception as exc:

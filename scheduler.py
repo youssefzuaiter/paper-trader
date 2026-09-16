@@ -99,19 +99,26 @@ def _log_event(action: TelemetryAction, *, ticker: str | None, status: str, deta
     )
 
 
-async def _run_one_cycle() -> None:
-    """One full ingest -> infer -> Tier-0 gate -> paper order -> receipt pass.
+async def run_signal_cycle(ticker: str, headline: str, *, submit: bool) -> dict[str, Any]:
+    """One full ingest -> infer -> Tier-0 gate -> (paper order ->) receipt
+    pass for ONE scenario, with telemetry and scenario-metrics emitted
+    along the way.
 
-    Mirrors ``main.execute``'s own body exactly (see ``main.py``'s
-    ``/signals/execute`` handler), using a randomly picked market scenario
-    in place of a caller-supplied ticker/headline — the same
-    ``inference.pick_random_scenario()`` the endpoint itself falls back to
-    when a request omits ``ticker``.
+    The single pipeline behind three callers (trader integration
+    hardening, ad hoc): the autonomous loop (``_run_one_cycle``, a random
+    scenario, ``submit=True``), ``POST /signals/execute`` (a caller-supplied
+    or random scenario, ``submit=True``) and ``POST /signals/evaluate``
+    (``submit=False`` — the Tier-0 gate runs, nothing is sent to the
+    broker). Before this, ``main.py``'s two endpoints duplicated the
+    body but skipped ``_log_event``/``send_scenario_metrics`` entirely,
+    so a manual call was invisible on PFW's Agent Activity page and never
+    reached its ``ScenarioMetrics`` table — with ``AUTONOMOUS_MODE`` off
+    the page stayed empty forever, however much the trader was used.
 
-    Also fires one ``webhook.send_scenario_metrics`` call per evaluation
-    (Phase 4, ad hoc), persisting the scenario hash, predicted move, and
-    Tier-0 decision to PFW's ``ScenarioMetrics`` table for durable
-    strategy analysis — independent of whether the scenario executed.
+    Returns the same dict ``/signals/execute`` has always returned
+    (``executed``/``plan``/``order``/``signal``/``receipt_delivery``, or
+    ``executed: False`` + ``rejection``); a dry run returns
+    ``approved``/``plan`` (or ``rejection``) plus ``quote`` instead.
 
     Shadow A/B pipeline (Phase 3, ad hoc): ``inference._shadow_evaluate``
     runs CONCURRENTLY with the primary ``inference.predict_move`` (and
@@ -125,7 +132,6 @@ async def _run_one_cycle() -> None:
     model's own ``signal`` decides what happens at the broker; the
     shadow model has no live effect of any kind.
     """
-    ticker, headline = inference.pick_random_scenario()
     quote, signal, shadow_signal = await asyncio.gather(
         inference.fetch_quote(ticker),
         inference.predict_move(ticker, headline),
@@ -135,18 +141,22 @@ async def _run_one_cycle() -> None:
     _log_event(
         "evaluate",
         ticker=ticker,
-        status="evaluating",
+        status="evaluating" if submit else "evaluating (dry run)",
         details=f"Scored {ticker} at {signal.predicted_move_pct:+.2f}% ({headline!r})",
     )
 
-    result = await execution.execute_signal(signal, quote)
+    result: dict[str, Any]
+    if submit:
+        result = await execution.execute_signal(signal, quote)
+    else:
+        result = _dry_run(signal, quote)
 
     if result.get("executed"):
         plan = result["plan"]
         order = result["order"]
         decision = "executed"
         logger.info(
-            "Autonomous cycle EXECUTED %s qty=%s @ %s (order %s, status=%s)",
+            "Cycle EXECUTED %s qty=%s @ %s (order %s, status=%s)",
             plan["symbol"], plan["quantity"], plan["limit_price"],
             order["id"], order["status"],
         )
@@ -159,17 +169,26 @@ async def _run_one_cycle() -> None:
                 f"(order {order['id']}, {order['status']})"
             ),
         )
+    elif result.get("approved"):
+        decision = "approved_dry_run"
+        logger.info("Dry run APPROVED %s: %s", ticker, result["plan"])
+        _log_event(
+            "evaluate",
+            ticker=ticker,
+            status="approved (dry run)",
+            details=f"Tier-0 gate cleared for {ticker}; nothing submitted (dry run)",
+        )
     else:
         rejection = result["rejection"]
         decision = rejection["code"]
         logger.info(
-            "Autonomous cycle REJECTED %s: %s (%s)",
+            "Cycle REJECTED %s: %s (%s)",
             ticker, rejection["code"], rejection["detail"],
         )
         _log_event(
             "reject",
             ticker=ticker,
-            status="rejected",
+            status="rejected" if submit else "rejected (dry run)",
             details=f"{rejection['code']}: {rejection['detail']}",
         )
 
@@ -183,16 +202,43 @@ async def _run_one_cycle() -> None:
     )
     if not metrics_delivery.get("delivered"):
         logger.warning(
-            "Scenario metrics for %s not delivered: %s", ticker, metrics_delivery.get("error"),
+            "Scenario metrics for %s not delivered: %s%s", ticker, metrics_delivery.get("error"),
+            " (queued for replay)" if metrics_delivery.get("queued") else "",
         )
+    return result
 
 
-#: Emergency kill switch. Only ever set by trigger_emergency_halt() below
-#: — never write this directly. Deliberately has no companion "resume"
-#: setter/endpoint: an emergency halt should require a deliberate
-#: restart of this process to clear, not an easy accidental toggle back
-#: on (see main.py's POST /control/halt for the same reasoning stated
-#: again at the actual HTTP boundary).
+def _dry_run(signal: Any, quote: Any) -> dict[str, Any]:
+    """The Tier-0 gate without the broker — ``/signals/evaluate``'s original body."""
+    payload: dict[str, Any] = {
+        "executed": False,
+        "signal": signal.model_dump(mode="json"),
+        "quote": {
+            "bid": str(quote.bid),
+            "ask": str(quote.ask),
+            "as_of": quote.as_of.isoformat(),
+        },
+    }
+    try:
+        plan = execution.validate_and_plan(signal, quote)
+    except execution.Tier0Rejection as rejection:
+        return payload | {
+            "approved": False,
+            "rejection": {"code": rejection.code.value, "detail": rejection.detail},
+        }
+    return payload | {"approved": True, "plan": plan.as_dict()}
+
+
+async def _run_one_cycle() -> None:
+    """One autonomous pass: a randomly picked market scenario through
+    ``run_signal_cycle`` — the same ``inference.pick_random_scenario()``
+    the ``/signals/*`` endpoints fall back to when a request omits
+    ``ticker``.
+    """
+    ticker, headline = inference.pick_random_scenario()
+    await run_signal_cycle(ticker, headline, submit=True)
+
+
 IS_HALTED: bool = False
 
 
@@ -370,7 +416,7 @@ async def _handle_trade_update(data: TradeUpdate) -> None:
         # Poison pill: PFW rejected this receipt outright (a contract
         # problem — e.g. insufficient_shares on a hypothetical SELL —
         # not a transient outage), the same "4xx will not fix itself"
-        # rule _sign_and_send's own retry loop already applies within one
+        # rule webhook._deliver's own retry loop already applies within one
         # delivery attempt. Without this, a permanently-rejected
         # settlement would otherwise just sit undelivered forever, since
         # a push stream never redelivers a past event on its own.
@@ -386,15 +432,23 @@ async def _handle_trade_update(data: TradeUpdate) -> None:
             details=f"Settlement permanently rejected (order {order_id}): {delivery.get('error')}",
         )
     else:
-        # NOT added to _synced_order_ids — but see this module's own
-        # docstring: unlike the old REST poller, nothing will naturally
-        # retry this specific fill event again. webhook.py's own
-        # _sign_and_send already retried transient failures 3x internally
-        # before returning here.
+        # A transient failure. webhook._deliver already retried 3x inline
+        # and has now handed the receipt to the durable outbox, whose
+        # replay loop re-signs and re-POSTs it with backoff until PFW
+        # acknowledges it — so, unlike before, this fill is NOT lost just
+        # because PFW was down for the few seconds around it. Marked
+        # synced here because the outbox now owns delivery; the push
+        # stream itself never redelivers a past event.
+        _synced_order_ids.append(order_id)
         logger.warning(
-            "Settlement receipt for order %s not delivered and will NOT be retried "
-            "(no periodic re-scan under the WebSocket architecture): %s",
+            "Settlement receipt for order %s not delivered inline; queued in the outbox for replay: %s",
             order_id, delivery.get("error"),
+        )
+        _log_event(
+            "error",
+            ticker=order.symbol,
+            status="queued",
+            details=f"Settlement receipt queued for replay (order {order_id}): {delivery.get('error')}",
         )
 
 

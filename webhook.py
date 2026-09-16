@@ -39,6 +39,7 @@ import hmac
 import json
 import logging
 import time
+import uuid
 from datetime import datetime
 from decimal import ROUND_HALF_UP, Decimal
 from typing import TYPE_CHECKING, Any, Final
@@ -46,6 +47,7 @@ from typing import TYPE_CHECKING, Any, Final
 import httpx
 
 from config import get_webhook_settings
+from outbox import ReceiptKind, SendOutcome, default_outbox
 
 if TYPE_CHECKING:  # avoid a circular import at runtime
     from execution import ExecutionPlan
@@ -216,25 +218,20 @@ def build_settlement_receipt(order: Any) -> dict[str, Any]:
     }
 
 
-async def _sign_and_send(receipt: dict[str, Any], url: str) -> dict[str, Any]:
-    """Sign and POST a receipt (pending, settled, OR scenario-metrics) to
-    ``url``. Never raises.
+async def send_once(url: str, receipt: dict[str, Any]) -> SendOutcome:
+    """Exactly one signed POST of ``receipt`` to ``url``. Never raises.
 
-    Shared by ``send_trade_receipt``/``send_settlement_receipt`` (both
-    pass ``get_webhook_settings().url``) and ``send_scenario_metrics``
-    (passes ``get_webhook_settings().metrics_url``, a genuinely different
-    endpoint/table on the PFW side) — the HMAC signing, retry/backoff,
-    and structured result shape are identical across all three; only how
-    the payload gets built, and where it's sent, differs.
+    The single primitive both the inline retry loop (``_deliver``) and the
+    durable outbox's replay loop are built on. Signs with a FRESH
+    timestamp every call — PFW rejects a timestamp older than its
+    300s replay window, so a replay hours later cannot reuse the headers
+    of the original attempt. The body bytes are identical every time
+    (``canonical_json`` is deterministic), so PFW's idempotency dedupe
+    still sees the same receipt.
 
-    The event this receipt describes has already happened by the time
-    this runs, so a delivery failure must not unwind it or surface as a
-    500 on the caller's own endpoint/loop. Failures are logged and
-    returned as structured status for the caller to record.
-
-    Retries are safe: the body, timestamp and signature are computed once
-    and replayed byte-for-byte, and ``idempotency_key`` lets the receiver
-    dedupe.
+    ``permanent`` is True for a 4xx other than 429: a contract problem
+    (bad signature, bad schema, a business rejection) that will not fix
+    itself, so neither the inline loop nor the outbox retries it.
     """
     settings = get_webhook_settings()
     body = canonical_json(receipt)
@@ -249,61 +246,95 @@ async def _sign_and_send(receipt: dict[str, Any], url: str) -> dict[str, Any]:
         "User-Agent": "tier0-paper-trader/1.0",
     }
 
-    last_error = "not attempted"
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            response = await client.post(url, content=body, headers=headers)
+    except httpx.HTTPError as exc:
+        return SendOutcome(delivered=False, permanent=False, error=f"{type(exc).__name__}: {exc}")
 
-    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-        for attempt in range(1, _MAX_ATTEMPTS + 1):
-            try:
-                response = await client.post(
-                    url, content=body, headers=headers
-                )
-            except httpx.HTTPError as exc:
-                last_error = f"{type(exc).__name__}: {exc}"
-                logger.warning(
-                    "Receipt POST attempt %d/%d failed: %s",
-                    attempt, _MAX_ATTEMPTS, last_error,
-                )
-            else:
-                if response.is_success:
-                    logger.info(
-                        "Receipt %s (%s) delivered (HTTP %d)",
-                        receipt["idempotency_key"], receipt["status"], response.status_code,
-                    )
-                    return {
-                        "delivered": True,
-                        "status_code": response.status_code,
-                        "attempts": attempt,
-                        "idempotency_key": receipt["idempotency_key"],
-                    }
+    if response.is_success:
+        return SendOutcome(delivered=True, permanent=False, status_code=response.status_code)
 
-                last_error = f"HTTP {response.status_code}: {response.text[:200]}"
-                # 4xx is a contract problem (bad signature, bad schema) and will
-                # not fix itself. Only 5xx and transport errors are retried.
-                if response.status_code < 500:
-                    logger.error(
-                        "Receipt %s rejected, not retrying: %s",
-                        receipt["idempotency_key"], last_error,
-                    )
-                    break
-                logger.warning(
-                    "Receipt POST attempt %d/%d failed: %s",
-                    attempt, _MAX_ATTEMPTS, last_error,
-                )
+    error = f"HTTP {response.status_code}: {response.text[:200]}"
+    permanent = 400 <= response.status_code < 500 and response.status_code != 429
+    return SendOutcome(delivered=False, permanent=permanent, error=error, status_code=response.status_code)
 
-            if attempt < _MAX_ATTEMPTS:
-                await asyncio.sleep(_BACKOFF_BASE_SECONDS * 2 ** (attempt - 1))
 
+async def _deliver(receipt: dict[str, Any], url: str, kind: ReceiptKind) -> dict[str, Any]:
+    """Sign and POST a receipt (pending, settled, OR scenario-metrics) to
+    ``url``, retrying briefly inline and then handing off to the durable
+    outbox. Never raises.
+
+    Shared by ``send_trade_receipt``/``send_settlement_receipt`` (both
+    pass ``get_webhook_settings().url``) and ``send_scenario_metrics``
+    (passes ``get_webhook_settings().metrics_url``, a genuinely different
+    endpoint/table on the PFW side) — the signing, retry/backoff, outbox
+    hand-off and structured result shape are identical across all three;
+    only how the payload gets built, and where it's sent, differs.
+
+    The event this receipt describes has already happened by the time
+    this runs, so a delivery failure must not unwind it or surface as a
+    500 on the caller's own endpoint/loop. Failures are logged and
+    returned as structured status for the caller to record.
+
+    Three quick inline attempts cover a blip (a PFW redeploy, a dropped
+    connection). Anything longer than ~1.5s used to mean the receipt was
+    simply lost — for an order that is ALREADY at the broker. Now a
+    retryable exhaustion is queued in ``outbox`` and replayed with
+    backoff until PFW acknowledges it; the result carries
+    ``"queued": True`` so a caller can say "queued for replay" rather
+    than "dropped". A permanent (4xx) rejection is still not retried —
+    it will not fix itself — and is reported the same way it always was.
+    """
+    last_outcome = SendOutcome(delivered=False, permanent=False, error="not attempted")
+
+    for attempt in range(1, _MAX_ATTEMPTS + 1):
+        last_outcome = await send_once(url, receipt)
+        if last_outcome.delivered:
+            logger.info(
+                "Receipt %s (%s) delivered (HTTP %d)",
+                receipt["idempotency_key"], receipt["status"], last_outcome.status_code,
+            )
+            return {
+                "delivered": True,
+                "status_code": last_outcome.status_code,
+                "attempts": attempt,
+                "idempotency_key": receipt["idempotency_key"],
+            }
+        if last_outcome.permanent:
+            logger.error(
+                "Receipt %s rejected, not retrying: %s",
+                receipt["idempotency_key"], last_outcome.error,
+            )
+            return {
+                "delivered": False,
+                "queued": False,
+                "error": last_outcome.error,
+                "attempts": attempt,
+                "idempotency_key": receipt["idempotency_key"],
+                "receipt": receipt,
+            }
+        logger.warning(
+            "Receipt POST attempt %d/%d failed: %s",
+            attempt, _MAX_ATTEMPTS, last_outcome.error,
+        )
+        if attempt < _MAX_ATTEMPTS:
+            await asyncio.sleep(_BACKOFF_BASE_SECONDS * 2 ** (attempt - 1))
+
+    await default_outbox.enqueue(kind, url, receipt, last_outcome.error)
     logger.error(
-        "Receipt %s (%s) undelivered after %d attempt(s): %s",
-        receipt["idempotency_key"], receipt["status"], _MAX_ATTEMPTS, last_error,
+        "Receipt %s (%s) undelivered after %d attempt(s), queued for replay: %s",
+        receipt["idempotency_key"], receipt["status"], _MAX_ATTEMPTS, last_outcome.error,
     )
     return {
         "delivered": False,
-        "error": last_error,
+        "queued": True,
+        "error": last_outcome.error,
         "attempts": _MAX_ATTEMPTS,
         "idempotency_key": receipt["idempotency_key"],
-        # Returned so a failed receipt can be replayed by hand without
-        # reconstructing (and re-signing) it.
+        # Returned so a failed receipt can be inspected without
+        # reconstructing (and re-signing) it; the outbox holds the copy
+        # that will actually be replayed.
         "receipt": receipt,
     }
 
@@ -317,7 +348,7 @@ async def send_trade_receipt(
 ) -> dict[str, Any]:
     """Sign and POST a "pending" receipt. See ``build_receipt``."""
     receipt = build_receipt(plan=plan, signal=signal, order=order, executed_at=executed_at)
-    return await _sign_and_send(receipt, get_webhook_settings().url)
+    return await _deliver(receipt, get_webhook_settings().url, "trade")
 
 
 async def send_settlement_receipt(order: Any) -> dict[str, Any]:
@@ -325,7 +356,7 @@ async def send_settlement_receipt(order: Any) -> dict[str, Any]:
     ``build_settlement_receipt``.
     """
     receipt = build_settlement_receipt(order)
-    return await _sign_and_send(receipt, get_webhook_settings().url)
+    return await _deliver(receipt, get_webhook_settings().url, "settlement")
 
 
 def build_scenario_metrics(
@@ -372,11 +403,15 @@ def build_scenario_metrics(
     scenario_hash = hashlib.sha256(f"{ticker}|{headline}".encode()).hexdigest()
     return {
         "schema_version": SCHEMA_VERSION,
-        # Informational only here — unlike the trade-receipt endpoints,
-        # PFW's metrics route enforces no idempotency-key dedup (a
-        # duplicate analytics row on retry is an acceptable, low-severity
-        # cost; this is telemetry, not money).
-        "idempotency_key": scenario_hash,
+        # One key PER EVALUATION EVENT, minted here and carried unchanged
+        # through the outbox, so a replay of THIS delivery dedupes on the
+        # PFW side while a genuine re-evaluation of the same scenario a
+        # few minutes later (this agent replays a fixed scenario set) is
+        # recorded as its own row. This used to be `scenario_hash` — fine
+        # while PFW ignored the key, and a real bug the moment PFW
+        # started deduping on it: three MSFT evaluations became one row.
+        # The scenario identity still travels as `hash` below.
+        "idempotency_key": uuid.uuid4().hex,
         "status": "metrics",
         "ticker": ticker,
         "hash": scenario_hash,
@@ -411,4 +446,4 @@ async def send_scenario_metrics(
         shadow_predicted_move_pct=shadow_predicted_move_pct,
         shadow_decision=shadow_decision,
     )
-    return await _sign_and_send(payload, get_webhook_settings().metrics_url)
+    return await _deliver(payload, get_webhook_settings().metrics_url, "metrics")

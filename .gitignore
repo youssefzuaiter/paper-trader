@@ -3,3 +3,6 @@ __pycache__/
 *.py[cod]
 .env
 .pytest_cache/
+# Durable webhook outbox (outbox.py): the agent's own record of real
+# orders awaiting redelivery to PFW. Runtime state, never source.
+outbox/

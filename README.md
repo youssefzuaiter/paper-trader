@@ -38,6 +38,8 @@ Paper keys: <https://app.alpaca.markets/paper/dashboard/overview> → *API Keys*
 | `inference.py` | 2 | Simulated quotes/news + FinBERT-shaped async inference. |
 | `execution.py` | 3 | Tier-0 gates, sizing, order construction, submission. |
 | `webhook.py`   | 4 | Canonical JSON receipt, HMAC-SHA256, `httpx` delivery. |
+| `outbox.py`    | — | Durable JSONL queue of receipts PFW never acknowledged; re-signed and replayed with backoff. |
+| `reconcile.py` | — | Re-derives settlement receipts from Alpaca's own order history (startup + hourly + on demand). |
 | `main.py`      | 1 | FastAPI app, lifespan, HTTP surface. |
 
 ---
@@ -73,10 +75,12 @@ the live one. Phase 1 made sandbox execution structural; routing it through
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| `GET`  | `/health` | Liveness + active Tier-0 limits. No credentials needed. |
+| `GET`  | `/health` | Liveness + active Tier-0 limits + `outbox_pending`. No credentials needed. |
 | `GET`  | `/account` | Paper account snapshot. |
+| `GET`  | `/telemetry` | The in-memory event feed (last 50 wake/evaluate/reject/execute/settle/sleep events). |
 | `POST` | `/signals/evaluate` | **Dry run.** Ingest → infer → gate. Submits nothing. |
 | `POST` | `/signals/execute` | Full pipeline, including order + receipt. |
+| `POST` | `/control/reconcile` | Re-send settlements for every fill Alpaca reports in `lookback_hours` (default 24, max 720). HMAC-verified inbound like `/control/halt`. Idempotent on the PFW side. |
 | `POST` | `/analyze/transaction` | Cash-flow anomaly check (Phase 3, ad hoc) — HMAC-verified inbound, same trust boundary as `/control/halt`. See [Cash-flow anomaly detection](#cash-flow-anomaly-detection). |
 | `GET`  | `/docs` | OpenAPI UI. |
 
@@ -89,6 +93,12 @@ curl -X POST localhost:8000/signals/evaluate \
 Omit `headline` to pull one from the simulated feed. A Tier-0 rejection is a
 normal `200` with `approved: false` — the engine declining to trade is an
 expected outcome, not an error.
+
+Both `/signals/*` endpoints run the same `scheduler.run_signal_cycle` pipeline
+as the autonomous loop, so a manual call shows up in `/telemetry` (a dry run is
+labelled `(dry run)`) and posts a scenario-metrics event to PFW like any
+autonomous cycle — previously neither happened, which left PFW's Agent
+Activity page empty whenever `AUTONOMOUS_MODE` was off.
 
 ---
 
@@ -157,7 +167,7 @@ translation layer:
 ```json
 {
   "schema_version": 1,
-  "idempotency_key": "3f0b59a7a419432885e2abb8e6eca9a7",
+  "idempotency_key": "<client_order_id — 32 hex chars>",
   "broker": "alpaca", "environment": "paper",
   "order_id": "...", "client_order_id": "...", "order_status": "accepted",
   "symbol": "NVDA", "side": "buy", "quantity": "0.082236842",
@@ -194,8 +204,49 @@ if (a.length !== b.length || !timingSafeEqual(a, b)) return new Response(null, {
 ```
 
 Delivery never raises: the trade has already executed, so a webhook failure is
-reported as structured status rather than unwinding the order. Retries replay the
-same bytes and signature, and `idempotency_key` lets the receiver dedupe.
+reported as structured status rather than unwinding the order.
+
+### Durable delivery (`outbox.py`)
+
+Three quick inline retries (~1.5s) cover a blip. Anything longer used to mean
+the receipt was simply lost — for an order already sitting at the broker. Now a
+retryable failure (transport error, 5xx, 429) is appended to
+`outbox/pending.jsonl` and a background loop replays it every 30s with capped
+exponential backoff (30s → 5min) until PFW returns 2xx. Each replay **re-signs
+with a fresh timestamp** — PFW rejects a signature older than 300s, so the
+original headers can't be reused — while the body bytes stay identical, and
+`idempotency_key` is what lets PFW dedupe a replay whose 2xx was lost in
+flight. A permanent 4xx goes to `outbox/dead-letter.jsonl` instead; entries
+older than 7 days are dead-lettered too. `GET /health` reports
+`outbox_pending`, which PFW's dashboard badge surfaces as "N undelivered
+receipts". The `outbox/` directory is runtime state, gitignored.
+
+### Reconciliation (`reconcile.py`)
+
+The outbox only helps once this process *knows* a delivery failed. Two
+real cases slip past it: a settlement PFW acknowledged with a 200 but had
+actually dropped (a race in PFW's own route, since fixed), and an order
+whose receipts were never generated because PFW was down at submit time.
+Alpaca is the source of truth for fills, so 15s after startup and then
+hourly, `reconcile_recent_fills` lists every CLOSED order in the last 24h,
+rebuilds each FILLED one's settlement receipt with the same
+`build_settlement_receipt(order)` the live WebSocket path uses, and
+re-sends it. PFW handles every outcome idempotently — already settled →
+`200`, stranded pending → settled `201`, never seen → created `201` — so
+re-sending is always safe. A `201` is logged as `RECOVERED` and shows on
+PFW's Agent Activity page as a `settle (reconciled)` event. Trigger a
+pass by hand (e.g. after a long PFW outage) with `POST /control/reconcile`
+and `{"lookback_hours": 168}`.
+
+### The receipt's ILS figures are informational
+
+`exchange_rate_at_entry`, `price_agorot` and `total_agorot` are computed from
+this service's fixed `USD_ILS_RATE` (default 3.7). PFW does **not** book them:
+it re-prices `native_price_amount` at its own Frankfurter-synced rate at
+receipt time (its law is "convert once, at execution, at the real rate") and
+logs a warning if the two rates differ by more than 2%. Keep sending them —
+the schema still requires them — but don't expect them to match what PFW
+stores.
 
 ---
 
