@@ -336,11 +336,16 @@ the placeholder** on PyPI's default wheel (which bundles CUDA support the
 box cannot use) — no room for anything. ~25 s to first inference
 including the one-time download, ~10 ms per headline after that
 (M-series Mac; a fractional-CPU instance is slower per headline, still
-far inside a 3-minute cycle). `/health` reports `memory_rss_mb` so the
-deployment answers the sizing question itself: deploy the CPU-wheel
-change first and watch the placeholder figure drop, then set the flag
-and watch it land in the 420–450 MB range. Above ~480 MB on a 512 MB
-instance, go back to the placeholder or upsize.
+far inside a 3-minute cycle). `/health` reports `memory_rss_mb` (the
+process's PEAK, which the model-load spike dominates) and
+`memory_rss_now_mb` (resident right now, Linux only — the figure the OOM
+killer acts on), so the deployment answers the sizing question itself:
+deploy the CPU-wheel change first and watch the placeholder figure drop,
+then set the flag and watch the steady-state number. The first FinBERT
+deploy (before `disable_prepacking`) peaked at 551 MB on Render's 512 MB
+instance and kept running — Render's limit evidently has slack — but a
+steady state above ~480 MB is the signal to go back to the placeholder
+or upsize.
 
 What changes, and what deliberately does not: `predict_move`'s contract,
 determinism, and the `asyncio.to_thread` dispatch are identical. The

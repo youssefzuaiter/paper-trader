@@ -223,6 +223,23 @@ def _peak_rss_mb() -> float:
     return round(peak / (1024 * 1024) if sys.platform == "darwin" else peak / 1024, 1)
 
 
+def _current_rss_mb() -> float | None:
+    """Resident memory RIGHT NOW, not the high-water mark — the figure an
+    OOM killer actually acts on. Loading the FinBERT graph spikes well
+    above steady state (the protobuf is parsed, copied into ORT's own
+    tensors, then freed), so the peak alone overstates what the process
+    holds afterwards: the first FinBERT deploy reported a 551 MB peak on a
+    512 MB instance and kept running. Linux only (``/proc/self/statm``);
+    ``None`` elsewhere rather than a guess.
+    """
+    try:
+        with open("/proc/self/statm", encoding="ascii") as f:
+            resident_pages = int(f.read().split()[1])
+    except (OSError, ValueError, IndexError):
+        return None
+    return round(resident_pages * resource.getpagesize() / (1024 * 1024), 1)
+
+
 @app.get("/health", tags=["ops"])
 async def health() -> dict[str, Any]:
     """Liveness probe. Never touches the broker, so it works without credentials."""
@@ -242,6 +259,7 @@ async def health() -> dict[str, Any]:
         # fit beside torch on this instance" is answered by the deployment
         # itself (README, "Real FinBERT"), not by a laptop measurement.
         "memory_rss_mb": _peak_rss_mb(),
+        "memory_rss_now_mb": _current_rss_mb(),
         "tier0_limits": {
             "min_predicted_gain_pct": str(execution.MIN_PREDICTED_GAIN_PCT),
             "max_notional_usd": str(execution.MAX_NOTIONAL_USD),
