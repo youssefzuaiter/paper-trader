@@ -81,6 +81,7 @@ the live one. Phase 1 made sandbox execution structural; routing it through
 | `POST` | `/signals/evaluate` | **Dry run.** Ingest → infer → gate. Submits nothing. |
 | `POST` | `/signals/execute` | Full pipeline, including order + receipt. |
 | `POST` | `/control/reconcile` | Re-send settlements for every fill Alpaca reports in `lookback_hours` (default 24, max 720). HMAC-verified inbound like `/control/halt`. Idempotent on the PFW side. |
+| `POST` | `/control/quotes` | Alpaca's latest IEX trade price for `symbols` (1–200) — `{quotes: {SYM: {price, timestamp}}, missing: [...]}`. PFW's daily quote sync calls this for every ticker a user holds that PFW's own mock feed can't price, so the Alpaca keys stay here. HMAC-verified inbound like `/control/halt`; an unknown symbol lands in `missing`, never fails the batch. |
 | `POST` | `/analyze/transaction` | Cash-flow anomaly check (Phase 3, ad hoc) — HMAC-verified inbound, same trust boundary as `/control/halt`. See [Cash-flow anomaly detection](#cash-flow-anomaly-detection). |
 | `GET`  | `/docs` | OpenAPI UI. |
 

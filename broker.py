@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import logging
 import ssl
+from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from functools import lru_cache
@@ -25,7 +27,7 @@ import certifi
 from alpaca.common.enums import BaseURL
 from alpaca.data.enums import DataFeed
 from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest, StockLatestQuoteRequest
+from alpaca.data.requests import StockBarsRequest, StockLatestQuoteRequest, StockLatestTradeRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.client import TradingClient
 from alpaca.trading.models import TradeAccount
@@ -250,6 +252,52 @@ def get_real_quote(ticker: str) -> tuple[Decimal, Decimal, datetime]:
         raise RealQuoteUnavailable(f"Alpaca returned an unusable quote for {ticker!r}: bid={bid} ask={ask}")
 
     return Decimal(str(bid)), Decimal(str(ask)), quote.timestamp
+
+
+@dataclass(frozen=True)
+class LatestPrice:
+    """One symbol's most recent trade on the IEX feed — the mark PFW values
+    a trader-booked holding at (see ``main.py``'s ``/control/quotes``)."""
+
+    symbol: str
+    price: Decimal
+    timestamp: datetime
+
+
+def get_latest_prices(symbols: Sequence[str], client: StockHistoricalDataClient | None = None) -> dict[str, LatestPrice]:
+    """Alpaca's latest trade price for each of ``symbols`` (one batched
+    request, IEX feed).
+
+    Returns only the symbols Alpaca actually answered for — a ticker it
+    has never heard of, or one with no IEX trade yet, is simply absent
+    from the result rather than an error, so one unknown symbol can never
+    fail the whole batch (the caller reports it as ``missing``). A
+    non-positive price is dropped the same way, matching
+    ``get_real_quote``'s "unusable quote" guard.
+
+    Raises:
+        ConfigError: via ``get_market_data_client()``, if broker
+            credentials aren't configured.
+        Exception: any transport/API failure from alpaca-py — the caller
+            (``/control/quotes``) maps that to a 502; PFW's own fallback
+            chain then values the holding at its last fill instead.
+    """
+    wanted = sorted({symbol.strip().upper() for symbol in symbols if symbol and symbol.strip()})
+    if not wanted:
+        return {}
+    data_client = client or get_market_data_client()
+    response = data_client.get_stock_latest_trade(StockLatestTradeRequest(symbol_or_symbols=wanted, feed=DataFeed.IEX))
+    prices: dict[str, LatestPrice] = {}
+    for symbol in wanted:
+        trade = response.get(symbol) if hasattr(response, "get") else None
+        if trade is None:
+            continue
+        price = getattr(trade, "price", None)
+        timestamp = getattr(trade, "timestamp", None)
+        if price is None or timestamp is None or price <= 0:
+            continue
+        prices[symbol] = LatestPrice(symbol=symbol, price=Decimal(str(price)), timestamp=timestamp)
+    return prices
 
 
 class AtrUnavailable(RuntimeError):

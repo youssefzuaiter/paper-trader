@@ -357,6 +357,45 @@ async def reconcile(request: Request) -> dict[str, Any]:
     return {"ok": stats.error is None, **stats.__dict__}
 
 
+class QuotesRequest(BaseModel):
+    symbols: list[str] = Field(min_length=1, max_length=200)
+
+
+@app.post("/control/quotes", tags=["control"])
+async def latest_quotes(request: Request) -> dict[str, Any]:
+    """Alpaca's latest IEX trade price for each requested symbol — the
+    mark PFW values a holding at when the ticker is one this agent booked
+    from a real fill rather than one of PFW's own seeded instruments (its
+    mock feed throws on anything else, which took its dashboard down for
+    the trading account once). PFW's server calls this from its daily
+    sync, never the browser; same HMAC trust boundary as ``/control/halt``
+    because the Alpaca credentials live here and only here. Symbols
+    Alpaca has no trade for come back under ``missing`` rather than
+    failing the batch.
+    """
+    raw_body = await _verify_control_request(request)
+    try:
+        params = QuotesRequest.model_validate_json(raw_body or b"{}")
+    except ValidationError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, exc.errors()) from exc
+    try:
+        prices = await asyncio.to_thread(broker.get_latest_prices, params.symbols)
+    except ConfigError as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001 — a market-data outage is a 502 for the caller, never a crash here
+        logger.warning("quotes: Alpaca market-data request failed: %s: %s", type(exc).__name__, exc)
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"Market data unavailable: {type(exc).__name__}") from exc
+    wanted = sorted({symbol.strip().upper() for symbol in params.symbols if symbol and symbol.strip()})
+    return {
+        "quotes": {
+            symbol: {"price": str(price.price), "timestamp": price.timestamp.isoformat()}
+            for symbol, price in prices.items()
+        },
+        "missing": [symbol for symbol in wanted if symbol not in prices],
+        "feed": "iex",
+    }
+
+
 @app.post("/control/halt", tags=["control"])
 async def halt(request: Request) -> dict[str, Any]:
     """Emergency kill switch.
