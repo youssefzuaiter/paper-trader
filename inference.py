@@ -12,8 +12,11 @@ model, but it has the exact shape of one:
 * the blocking forward pass dispatched via ``asyncio.to_thread`` so a CPU-bound
   transformer never stalls the FastAPI event loop.
 
-Swapping in the real model is a two-line change inside ``_load_model`` plus
-``pip install transformers`` — nothing downstream of ``predict_move`` changes.
+The real model is one environment variable away: ``SENTIMENT_MODEL=finbert``
+loads ProsusAI/finbert as an int8 ONNX graph (see ``_load_finbert``) —
+nothing downstream of ``predict_move`` changes, and the placeholder stays
+the default so the test suite and a credential-free checkout keep working
+with no download and no extra memory.
 
 Every output is **deterministic** in ``(ticker, headline)``. A Tier-0 engine
 whose upstream signal is random is untestable: the same headline must always
@@ -25,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import os
 import random
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -32,6 +36,7 @@ from decimal import Decimal
 from functools import lru_cache
 from typing import Final
 
+import numpy as np
 import torch
 from pydantic import BaseModel, Field
 
@@ -40,7 +45,27 @@ from config import ConfigError
 
 logger = logging.getLogger(__name__)
 
-MODEL_NAME: Final[str] = "placeholder-finbert-v0"
+PLACEHOLDER_MODEL_NAME: Final[str] = "placeholder-finbert-v0"
+
+#: ``SENTIMENT_MODEL=finbert`` selects the real checkpoint; anything else
+#: (including unset) is the placeholder. Read once at import, like every
+#: other setting in config.py — a model is not something to hot-swap.
+FINBERT_ENABLED: Final[bool] = os.getenv("SENTIMENT_MODEL", "").strip().lower() == "finbert"
+
+#: Xenova/finbert is ProsusAI/finbert exported to ONNX (its config.json
+#: names ProsusAI/finbert as ``_name_or_path`` and keeps the identical
+#: label order, verified against both repos' config.json on 2026-09-18).
+#: The int8 graph is 110 MB on disk and never materialises fp32 weights —
+#: the fp32 checkpoint alone is 438 MB, which a 512 MB Render instance
+#: cannot even LOAD, let alone run beside torch. Overridable for a private
+#: mirror; the label order must stay 0=positive, 1=negative, 2=neutral.
+FINBERT_REPO: Final[str] = os.getenv("SENTIMENT_MODEL_REPO", "Xenova/finbert").strip() or "Xenova/finbert"
+FINBERT_FILE: Final[str] = os.getenv("SENTIMENT_MODEL_FILE", "onnx/model_int8.onnx").strip() or "onnx/model_int8.onnx"
+#: BERT's positional limit is 512; a headline is a sentence. 128 bounds a
+#: pathological input's inference cost without ever truncating a real one.
+_FINBERT_MAX_TOKENS: Final[int] = 128
+
+MODEL_NAME: Final[str] = f"finbert-onnx-int8 ({FINBERT_REPO})" if FINBERT_ENABLED else PLACEHOLDER_MODEL_NAME
 _EMBEDDING_DIM: Final[int] = 64
 _NUM_LABELS: Final[int] = 3  # positive, negative, neutral
 _WEIGHT_SEED: Final[int] = 20260905
@@ -130,19 +155,80 @@ class _PlaceholderFinBERT(torch.nn.Module):
 
 @lru_cache(maxsize=1)
 def _load_model() -> _PlaceholderFinBERT:
-    """Load the sentiment model once per process.
+    """Load the placeholder network once per process.
 
-    To use the real checkpoint, replace this body with::
-
-        from transformers import AutoModelForSequenceClassification, AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained("ProsusAI/finbert")
-        model = AutoModelForSequenceClassification.from_pretrained("ProsusAI/finbert")
-        return model.eval()
-
-    and tokenize the headline in ``_embed`` instead of hashing it.
+    Still the primary model unless ``SENTIMENT_MODEL=finbert``, and ALWAYS
+    the shadow model's network (``_shadow_score_sync``): the shadow is a
+    mock A/B comparator whose whole point is a cheap, deterministic second
+    opinion, not a second 110 MB graph.
     """
-    logger.info("Loading sentiment model %s", MODEL_NAME)
+    logger.info("Loading sentiment model %s", PLACEHOLDER_MODEL_NAME)
     return _PlaceholderFinBERT()
+
+
+@dataclass(frozen=True, slots=True)
+class _FinBERT:
+    """The real checkpoint: a fast tokenizer plus an ONNX Runtime session.
+
+    ``input_names`` is read off the graph rather than assumed — optimum's
+    BERT exports take ``input_ids``/``attention_mask``/``token_type_ids``,
+    but an alternative export may drop the third, and feeding an input the
+    graph does not declare is an error, not a no-op.
+    """
+
+    tokenizer: object
+    session: object
+    input_names: frozenset[str]
+
+
+@lru_cache(maxsize=1)
+def _load_finbert() -> _FinBERT:
+    """Download (once, into the Hugging Face cache) and open the int8 graph.
+
+    Imported lazily so a placeholder deployment never pays for onnxruntime,
+    tokenizers or huggingface_hub at import time. ``main.py``'s startup
+    warmup is what triggers this, so a missing download fails the boot —
+    loudly, before the first real cycle — instead of the first order.
+    Memory: the session maps the 110 MB file and allocates its arena on
+    first run; measured ~+150 MB RSS on top of the torch baseline this
+    process already carries (numbers in the README).
+    """
+    import onnxruntime as ort
+    from huggingface_hub import hf_hub_download
+    from tokenizers import Tokenizer
+
+    logger.info("Loading sentiment model %s (%s)", MODEL_NAME, FINBERT_FILE)
+    model_path = hf_hub_download(FINBERT_REPO, FINBERT_FILE)
+    tokenizer_path = hf_hub_download(FINBERT_REPO, "tokenizer.json")
+
+    tokenizer = Tokenizer.from_file(tokenizer_path)
+    tokenizer.enable_truncation(_FINBERT_MAX_TOKENS)
+
+    options = ort.SessionOptions()
+    # One headline at a time on a fractional-CPU instance: thread pools
+    # only add contention and per-thread arenas here.
+    options.intra_op_num_threads = 1
+    options.inter_op_num_threads = 1
+    session = ort.InferenceSession(model_path, options, providers=["CPUExecutionProvider"])
+    return _FinBERT(
+        tokenizer=tokenizer,
+        session=session,
+        input_names=frozenset(i.name for i in session.get_inputs()),
+    )
+
+
+def _finbert_logits(headline: str) -> np.ndarray:
+    """Tokenise one headline and run the graph; returns the 3 raw logits."""
+    fb = _load_finbert()
+    encoding = fb.tokenizer.encode(headline)  # type: ignore[attr-defined]
+    feeds: dict[str, np.ndarray] = {
+        "input_ids": np.asarray([encoding.ids], dtype=np.int64),
+        "attention_mask": np.asarray([encoding.attention_mask], dtype=np.int64),
+        "token_type_ids": np.asarray([encoding.type_ids], dtype=np.int64),
+    }
+    feeds = {name: value for name, value in feeds.items() if name in fb.input_names}
+    (logits,) = fb.session.run(None, feeds)  # type: ignore[attr-defined]
+    return np.asarray(logits, dtype=np.float32)[0]
 
 
 def _embed(ticker: str, headline: str) -> torch.Tensor:
@@ -168,11 +254,21 @@ def _lexical_prior(headline: str) -> torch.Tensor:
 
 
 def _score_sync(ticker: str, headline: str) -> tuple[float, float, float]:
-    """Blocking forward pass. Returns ``(p_positive, p_negative, p_neutral)``."""
-    model = _load_model()
-    with torch.no_grad():
-        logits = model(_embed(ticker, headline)) + _lexical_prior(headline)
-        probs = torch.softmax(logits, dim=-1)
+    """Blocking forward pass. Returns ``(p_positive, p_negative, p_neutral)``.
+
+    The real model sees the headline alone — the ticker is already in the
+    text of every headline this agent ingests, and FinBERT was trained on
+    sentences, not ``TICKER|sentence`` pairs. The lexical prior is a
+    placeholder-only nudge and is deliberately NOT applied on top of a
+    trained classifier's own probabilities.
+    """
+    if FINBERT_ENABLED:
+        logits = torch.from_numpy(_finbert_logits(headline))
+    else:
+        model = _load_model()
+        with torch.no_grad():
+            logits = model(_embed(ticker, headline)) + _lexical_prior(headline)
+    probs = torch.softmax(logits, dim=-1)
     return tuple(round(float(p), 6) for p in probs)  # type: ignore[return-value]
 
 
@@ -324,16 +420,20 @@ _HEADLINE_TEMPLATES: Final[tuple[str, ...]] = (
 
 #: Diverse (ticker, headline) scenarios for stress-testing the Tier-0
 #: gates end to end, instead of repeatedly hitting the same hardcoded
-#: NVDA headline. Each entry's predicted_move_pct against the current
-#: placeholder model (verified by hand, not just by keyword-counting):
-#:   TSLA  ~+14.8%  wildly bullish   -> clears MIN_PREDICTED_GAIN_PCT
-#:   AAPL   ~+6.1%  mildly positive  -> below the 10% gate, rejected
-#:   MSFT  ~-14.5%  highly bearish   -> well below the gate, rejected
-#:   AMZN   ~+0.4%  neutral          -> below the gate, rejected
-#:   GOOGL ~+14.8%  wildly bullish   -> clears MIN_PREDICTED_GAIN_PCT
-#: Re-verify these if the model weights, MIN_PREDICTED_GAIN_PCT, or the
-#: _BULLISH/_BEARISH lexical-prior sets ever change — the exact
-#: magnitudes are a placeholder-model artifact, not a guarantee.
+#: NVDA headline. Each entry's predicted_move_pct under BOTH models
+#: (measured, not keyword-counted — 2026-09-18, int8 ONNX graph):
+#:            placeholder      real FinBERT
+#:   TSLA     ~+14.8% clears   +11.9% clears   (pos 0.84)
+#:   AAPL      ~+6.1% rejected  +7.0% rejected (pos 0.54, neu 0.40)
+#:   MSFT     ~-14.5% rejected -11.6% rejected (neg 0.84)
+#:   AMZN      ~+0.4% rejected  +0.2% rejected (neu 0.93)
+#:   GOOGL    ~+14.8% clears    +2.3% rejected (neu 0.77)
+#: The real model reads "wins antitrust approval and announces AI
+#: breakthrough acquisition" as mostly neutral corporate news, so under
+#: FinBERT only TSLA clears the 10% gate — a genuine difference of
+#: opinion, left as-is rather than retuning the headline to flatter the
+#: gate. Re-verify if the weights, MIN_PREDICTED_GAIN_PCT, or the
+#: _BULLISH/_BEARISH lexical-prior sets change.
 MARKET_SCENARIOS: Final[tuple[tuple[str, str], ...]] = (
     ("TSLA", "TSLA soars on blowout deliveries as it wins major approval and raises full-year guidance"),
     ("AAPL", "AAPL beats modest expectations but issues cautious commentary for next quarter"),

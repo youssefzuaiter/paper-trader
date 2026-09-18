@@ -24,6 +24,14 @@ torch>=2.4
 # `.env` loading is a hard requirement of Phase 1 and stdlib has no equivalent.
 python-dotenv>=1.0
 
-# NOTE: `transformers` is deliberately absent. inference.py ships a deterministic
-# torch placeholder; add `transformers>=4.44` only when swapping in the real
-# ProsusAI/finbert checkpoint (see inference.py::_load_model).
+# --- Real FinBERT (inference.py::_load_finbert, enabled by SENTIMENT_MODEL=finbert) ---
+# ProsusAI/finbert as an int8 ONNX graph (Xenova/finbert), run by ONNX Runtime
+# with the `tokenizers` fast tokenizer — no `transformers`, and the 438 MB
+# fp32 checkpoint is never loaded, which is what lets this fit beside torch
+# on a 512 MB instance. huggingface_hub fetches the 110 MB file into its
+# cache once per deploy. All three are imported lazily, so the placeholder
+# default pays nothing for them at runtime.
+onnxruntime>=1.20
+tokenizers>=0.20
+huggingface_hub>=0.25
+numpy>=1.26

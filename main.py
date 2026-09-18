@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import resource
+import sys
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -215,6 +217,12 @@ async def telemetry() -> list[dict[str, Any]]:
     return list(agent_telemetry)
 
 
+def _peak_rss_mb() -> float:
+    """ru_maxrss is kilobytes on Linux and bytes on macOS — normalise to MB."""
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return round(peak / (1024 * 1024) if sys.platform == "darwin" else peak / 1024, 1)
+
+
 @app.get("/health", tags=["ops"])
 async def health() -> dict[str, Any]:
     """Liveness probe. Never touches the broker, so it works without credentials."""
@@ -230,6 +238,10 @@ async def health() -> dict[str, Any]:
         # (outbox.py). PFW's dashboard badge surfaces a non-zero count.
         "outbox_pending": default_outbox.pending_count(),
         "model": inference.MODEL_NAME,
+        # Peak resident memory of this process, so "does the real FinBERT
+        # fit beside torch on this instance" is answered by the deployment
+        # itself (README, "Real FinBERT"), not by a laptop measurement.
+        "memory_rss_mb": _peak_rss_mb(),
         "tier0_limits": {
             "min_predicted_gain_pct": str(execution.MIN_PREDICTED_GAIN_PCT),
             "max_notional_usd": str(execution.MAX_NOTIONAL_USD),

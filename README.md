@@ -283,9 +283,9 @@ the transaction fields in the request body.
 
 ## What is a placeholder
 
-`inference.py` ships a fixed-weight `torch.nn.Module` over a SHA-256
-pseudo-embedding, plus a small lexical prior so the stub behaves intelligibly
-during development. It has the real model's contract — 3-class logits in
+By default, `inference.py` ships a fixed-weight `torch.nn.Module` over a
+SHA-256 pseudo-embedding, plus a small lexical prior so the stub behaves
+intelligibly during development (the real model is the next subsection). It has the real model's contract — 3-class logits in
 ProsusAI/finbert's label order (`0=positive, 1=negative, 2=neutral`), softmax,
 blocking forward dispatched through `asyncio.to_thread` so a CPU-bound
 transformer never stalls the event loop.
@@ -294,9 +294,49 @@ Output is **deterministic in `(ticker, headline)`**. A Tier-0 engine whose
 upstream signal is random is untestable: the same headline must always produce
 the same order.
 
-To swap in the real model: `pip install transformers`, replace the body of
-`_load_model`, and tokenise in `_embed` instead of hashing. Nothing downstream of
-`predict_move` changes.
+### Real FinBERT (`SENTIMENT_MODEL=finbert`)
+
+The real checkpoint is one environment variable away, and it is the
+placeholder that stays the default — the test suite, a credential-free
+checkout and a memory-constrained deployment all keep working with no
+download.
+
+| | |
+|---|---|
+| `SENTIMENT_MODEL=finbert` | Primary model becomes ProsusAI/finbert. Anything else (or unset) keeps the placeholder. |
+| `SENTIMENT_MODEL_REPO` / `SENTIMENT_MODEL_FILE` | Default `Xenova/finbert` / `onnx/model_int8.onnx`. Override only for a private mirror; the label order must stay `0=positive, 1=negative, 2=neutral`. |
+| `HF_HOME` | Where huggingface_hub caches the 110 MB graph (default `~/.cache/huggingface`). Render's disk is ephemeral, so every deploy re-downloads once, at boot. |
+
+How it fits in 512 MB: `Xenova/finbert` is ProsusAI/finbert exported to
+ONNX (its `config.json` names ProsusAI/finbert as the source and keeps the
+identical label order — checked against both repos), and the **int8** graph
+is 110 MB. It runs on ONNX Runtime with the `tokenizers` fast tokenizer —
+no `transformers`, and the 438 MB fp32 checkpoint is never loaded, which is
+the difference between fitting beside torch and OOM-ing during startup.
+Measured 2026-09-18 on an M-series Mac: the whole service peaks at
+**375 MB RSS** with the real model warm (254 MB for a bare torch+ORT
+process), ~25 s to first inference including the download, ~10 ms per
+headline after that. Linux numbers differ, which is why `/health` now
+reports `memory_rss_mb` — read it on the deployment after enabling; if it
+sits above ~450 MB on a 512 MB instance, go back to the placeholder or
+upsize.
+
+What changes, and what deliberately does not: `predict_move`'s contract,
+determinism, and the `asyncio.to_thread` dispatch are identical. The
+placeholder's lexical prior is **not** applied on top of the trained
+model's probabilities. The shadow A/B comparator (`_shadow_evaluate`)
+keeps running the placeholder network — it is a cheap second opinion by
+design, not a second graph. And the fixed `MARKET_SCENARIOS` are scored
+by both models in `inference.py`'s table: the real model reads the GOOGL
+"antitrust approval / AI acquisition" headline as mostly neutral (+2.3 %),
+so under FinBERT only the TSLA scenario clears the 10 % gate — a genuine
+difference of opinion, recorded rather than tuned away.
+
+Enable on Render: Environment → add `SENTIMENT_MODEL=finbert` → Manual
+Deploy. The startup warmup downloads and loads the graph before the
+service reports healthy; `/health` shows `"model": "finbert-onnx-int8
+(Xenova/finbert)"` and the memory figure. To test the real path locally:
+`SENTIMENT_MODEL=finbert pytest tests/test_inference_finbert.py`.
 
 Also simulated: quotes (`fetch_quote`) and the news feed
 (`fetch_latest_headline`), both deterministic with time-based drift.
