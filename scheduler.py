@@ -56,6 +56,7 @@ import broker
 import execution
 import inference
 import webhook
+from config import ConfigError
 
 logger = logging.getLogger("tier0.scheduler")
 
@@ -499,7 +500,18 @@ async def websocket_settlement_stream() -> None:
     raising past its own retry logic entirely (e.g. a bug, or every
     retry exhausted in some way its own code doesn't loop past).
     """
-    stream = broker.get_trading_stream()
+    # No broker credentials means nothing can ever fill, so there is
+    # nothing to settle: idle here rather than die. Dying would leave this
+    # task holding a ConfigError that the lifespan's shutdown `await`
+    # re-raises as a traceback on every credential-free stop (a container
+    # measurement without an .env, a fresh checkout) — the same condition
+    # reconcile_loop already treats as a logged no-op.
+    try:
+        stream = broker.get_trading_stream()
+    except ConfigError as exc:
+        logger.warning("Settlement stream idle — %s", exc)
+        await asyncio.Event().wait()  # sleeps until cancelled at shutdown
+        return
     stream.subscribe_trade_updates(_handle_trade_update)
 
     retries = 0

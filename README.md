@@ -313,13 +313,25 @@ identical label order — checked against both repos), and the **int8** graph
 is 110 MB. It runs on ONNX Runtime with the `tokenizers` fast tokenizer —
 no `transformers`, and the 438 MB fp32 checkpoint is never loaded, which is
 the difference between fitting beside torch and OOM-ing during startup.
-Measured 2026-09-18 on an M-series Mac: the whole service peaks at
-**375 MB RSS** with the real model warm (254 MB for a bare torch+ORT
-process), ~25 s to first inference including the download, ~10 ms per
-headline after that. Linux numbers differ, which is why `/health` now
-reports `memory_rss_mb` — read it on the deployment after enabling; if it
-sits above ~450 MB on a 512 MB instance, go back to the placeholder or
-upsize.
+Measured 2026-09-18, in a Linux container capped at 512 MB (Render's
+limit), installed from `requirements.txt` alone:
+
+| model | warm | after 8 inferences |
+|---|---|---|
+| placeholder | 291 MB | 302 MB |
+| FinBERT | 433 MB | 448 MB |
+
+Both depend on the **CPU-only torch wheel** `requirements.txt` now pins
+via PyTorch's index: the live Render service measured **460.8 MB with
+the placeholder** on PyPI's default wheel (which bundles CUDA support the
+box cannot use) — no room for anything. ~25 s to first inference
+including the one-time download, ~10 ms per headline after that
+(M-series Mac; a fractional-CPU instance is slower per headline, still
+far inside a 3-minute cycle). `/health` reports `memory_rss_mb` so the
+deployment answers the sizing question itself: deploy the CPU-wheel
+change first and watch the placeholder figure drop, then set the flag
+and watch it land near 450 MB. Above ~480 MB on a 512 MB instance, go
+back to the placeholder or upsize.
 
 What changes, and what deliberately does not: `predict_move`'s contract,
 determinism, and the `asyncio.to_thread` dispatch are identical. The

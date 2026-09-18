@@ -18,6 +18,17 @@ httpx>=0.27
 
 # --- Phase 2: inference runtime; also backs models/autoencoder.py's
 # genuinely-trained cash-flow anomaly detector (Phase 3, ad hoc) ---
+# The CPU-only wheel, on purpose. PyPI's default Linux wheel bundles CUDA
+# support that a Render instance has no GPU to use, and just importing it
+# costs ~250 MB of resident memory more than the CPU build: the live
+# service measured 460.8 MB peak RSS with the PLACEHOLDER model on a
+# 512 MB instance (its own /health, 2026-09-18), leaving no room for
+# FinBERT. With this index pip resolves `2.x.y+cpu` on Linux (a local
+# version label sorts ABOVE the plain PyPI release, so it wins) and the
+# ordinary wheel on macOS/Windows, where the CPU index simply has no
+# +cpu build. Measured in a 512 MB-capped Linux container: 432 MB with
+# FinBERT warm, 451 MB after eight inferences, no OOM kill.
+--extra-index-url https://download.pytorch.org/whl/cpu
 torch>=2.4
 
 # Credential loading for broker.py / webhook.py. Not in the original list, but
