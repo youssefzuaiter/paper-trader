@@ -189,9 +189,8 @@ def _load_finbert() -> _FinBERT:
     tokenizers or huggingface_hub at import time. ``main.py``'s startup
     warmup is what triggers this, so a missing download fails the boot —
     loudly, before the first real cycle — instead of the first order.
-    Memory: the session maps the 110 MB file and allocates its arena on
-    first run; measured ~+150 MB RSS on top of the torch baseline this
-    process already carries (numbers in the README).
+    Memory: measured on Linux, the session adds ~+138 MB RSS on top of
+    whatever this process already carries (numbers in the README).
     """
     import onnxruntime as ort
     from huggingface_hub import hf_hub_download
@@ -209,6 +208,13 @@ def _load_finbert() -> _FinBERT:
     # only add contention and per-thread arenas here.
     options.intra_op_num_threads = 1
     options.inter_op_num_threads = 1
+    # ORT "prepacks" every MatMul weight into a second, kernel-optimised
+    # copy at session creation — a speed trade that costs memory this
+    # deployment cannot spare: measured on Linux, the 110 MB graph
+    # resident at +192 MB with prepacking and +138 MB without, for 11 ms
+    # vs 17 ms per headline. At one headline per cycle the 54 MB is the
+    # margin that keeps a 512 MB instance out of the OOM killer.
+    options.add_session_config_entry("session.disable_prepacking", "1")
     session = ort.InferenceSession(model_path, options, providers=["CPUExecutionProvider"])
     return _FinBERT(
         tokenizer=tokenizer,

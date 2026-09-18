@@ -319,7 +319,16 @@ limit), installed from `requirements.txt` alone:
 | model | warm | after 8 inferences |
 |---|---|---|
 | placeholder | 291 MB | 302 MB |
-| FinBERT | 433 MB | 448 MB |
+| FinBERT (before `disable_prepacking`) | 433 MB | 448 MB |
+| FinBERT | ~380 MB | ~395 MB |
+
+The last row is derived, not re-measured end to end: ONNX Runtime's
+`session.disable_prepacking` (set in `_load_finbert`) cut the graph's own
+resident cost from +192 MB to +138 MB in an isolated measurement, at
+11 → 17 ms per headline — a speed trade this one-headline-per-cycle
+service never notices, and the margin that keeps the instance out of the
+OOM killer. The live deployment reported 337 MB with the placeholder on
+the CPU wheel (x86 runs a little above the arm64 container).
 
 Both depend on the **CPU-only torch wheel** `requirements.txt` now pins
 via PyTorch's index: the live Render service measured **460.8 MB with
@@ -330,8 +339,8 @@ including the one-time download, ~10 ms per headline after that
 far inside a 3-minute cycle). `/health` reports `memory_rss_mb` so the
 deployment answers the sizing question itself: deploy the CPU-wheel
 change first and watch the placeholder figure drop, then set the flag
-and watch it land near 450 MB. Above ~480 MB on a 512 MB instance, go
-back to the placeholder or upsize.
+and watch it land in the 420–450 MB range. Above ~480 MB on a 512 MB
+instance, go back to the placeholder or upsize.
 
 What changes, and what deliberately does not: `predict_move`'s contract,
 determinism, and the `asyncio.to_thread` dispatch are identical. The
