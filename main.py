@@ -40,6 +40,7 @@ from config import (
     get_broker_settings,
     get_webhook_settings,
     is_autonomous_mode_enabled,
+    orders_via_risk_router,
 )
 from models import autoencoder
 from scheduler import (
@@ -118,7 +119,12 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     # any unset/non-truthy value), so a fresh checkout never starts
     # submitting trades on its own.
     autonomous_task: asyncio.Task[None] | None = None
-    if is_autonomous_mode_enabled():
+    if orders_via_risk_router():
+        logger.warning(
+            "ORDERS_VIA_RISK_ROUTER is on — this process places no orders; the Risk & Routing "
+            "agent does. Settlement, outbox and reconciliation keep running here."
+        )
+    elif is_autonomous_mode_enabled():
         logger.info("AUTONOMOUS_MODE enabled — starting background trading_loop()")
         autonomous_task = asyncio.create_task(trading_loop())
     else:
@@ -254,6 +260,7 @@ async def health() -> dict[str, Any]:
         # Receipts queued for replay because PFW never acknowledged them
         # (outbox.py). PFW's dashboard badge surfaces a non-zero count.
         "outbox_pending": default_outbox.pending_count(),
+        "places_orders": not orders_via_risk_router(),
         "model": inference.MODEL_NAME,
         # Peak resident memory of this process, so "does the real FinBERT
         # fit beside torch on this instance" is answered by the deployment
@@ -577,6 +584,12 @@ async def execute(request: SignalRequest) -> dict[str, Any]:
     ``scheduler.run_signal_cycle`` pipeline as the autonomous loop, so the
     telemetry/metrics side effects are identical to an autonomous cycle.
     """
+    if orders_via_risk_router():
+        raise HTTPException(
+            status.HTTP_410_GONE,
+            "Order placement has moved to the Risk & Routing agent (POST /v1/signals). "
+            "/signals/evaluate still works here as a dry run.",
+        )
     ticker, headline = await _resolve_ticker_and_headline(request)
     try:
         return await run_signal_cycle(ticker, headline, submit=True)

@@ -210,3 +210,20 @@ def is_autonomous_mode_enabled() -> bool:
     autonomous paper trades on its own.
     """
     return os.getenv("AUTONOMOUS_MODE", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def orders_via_risk_router() -> bool:
+    """True when ``ORDERS_VIA_RISK_ROUTER`` is truthy: order placement has
+    moved to the Risk & Routing agent (``risk_router/``).
+
+    This process then places no orders at all — ``/signals/execute``
+    answers 410, and the autonomous loop does not start even with
+    ``AUTONOMOUS_MODE`` on — while it keeps doing everything else:
+    settlement stream, outbox, reconciliation, quotes, control, anomaly
+    scoring. Those settle fills account-wide, the router's included.
+
+    Off by default so an existing deployment keeps trading until the
+    router is actually running somewhere. While it is off, this process
+    can still buy past the router's portfolio limits.
+    """
+    return os.getenv("ORDERS_VIA_RISK_ROUTER", "").strip().lower() in {"1", "true", "yes", "on"}

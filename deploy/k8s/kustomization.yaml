@@ -1,0 +1,10 @@
+# The whole swarm: namespace, bus, the three upstream agents, the gatekeeper.
+# Build the three images first (see README.md).
+# Secrets are created by hand (see README.md), never committed.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespace.yaml
+  - redis.yaml
+  - agents.yaml
+  - risk-router.yaml

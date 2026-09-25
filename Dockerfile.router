@@ -1,0 +1,29 @@
+# Risk & Routing agent image.
+#   docker build -f Dockerfile.router -t paper-trader/risk-router:0.1.0 .
+#
+# Copies an explicit file list rather than the build context, so .env,
+# .venv, outbox/ and the model checkpoints can never end up in the image.
+FROM python:3.13-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    ROUTER_STATE_DIR=/app/state
+
+WORKDIR /app
+
+COPY risk_router/requirements.txt /tmp/requirements.txt
+RUN pip install -r /tmp/requirements.txt && rm /tmp/requirements.txt
+
+COPY config.py outbox.py tier0.py webhook.py ./
+COPY risk_router/ risk_router/
+
+# state/ holds the kill switch and breaker latch; outbox/ holds receipts
+# PFW hasn't acknowledged. Both are mounted from the StatefulSet's volume.
+RUN useradd --uid 10001 --no-create-home --shell /usr/sbin/nologin router \
+ && mkdir -p /app/state /app/outbox \
+ && chown router /app/state /app/outbox
+USER 10001
+
+EXPOSE 8080
+CMD ["uvicorn", "risk_router.app:app", "--host", "0.0.0.0", "--port", "8080", "--no-access-log"]

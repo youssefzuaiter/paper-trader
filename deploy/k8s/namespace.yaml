@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: paper-trader
+  labels:
+    app.kubernetes.io/part-of: paper-trader
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pfw-endpoints
+  namespace: paper-trader
+data:
+  # PFW runs outside the cluster. Point these at its public URL.
+  trades-url: http://host.docker.internal:3000/api/webhooks/trades
+  metrics-url: http://host.docker.internal:3000/api/webhooks/metrics

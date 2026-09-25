@@ -1,0 +1,9 @@
+# Inference agent: FinBERT (int8 ONNX, no torch) + the scikit-learn return model.
+-r requirements.txt
+onnxruntime>=1.20
+tokenizers>=0.20
+huggingface_hub>=0.25
+# Pinned to the version models/return_model/ was trained with: a joblib'd
+# estimator is only guaranteed to load on the scikit-learn that wrote it.
+scikit-learn==1.9.1
+joblib>=1.4

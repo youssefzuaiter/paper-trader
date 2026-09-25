@@ -1,0 +1,11 @@
+# Risk & Routing agent only — no torch, no alpaca-py, no pandas.
+# It talks to Alpaca over plain REST (risk_router/alpaca_async.py) and
+# shares only tier0.py, config.py, webhook.py and outbox.py with the
+# monolith, none of which need more than this.
+fastapi>=0.115
+uvicorn[standard]>=0.32
+pydantic>=2.9
+httpx>=0.27
+python-dotenv>=1.0
+# zoneinfo needs an IANA database; slim images don't ship one.
+tzdata>=2024.1

@@ -41,6 +41,78 @@ Paper keys: <https://app.alpaca.markets/paper/dashboard/overview> → *API Keys*
 | `outbox.py`    | — | Durable JSONL queue of receipts PFW never acknowledged; re-signed and replayed with backoff. |
 | `reconcile.py` | — | Re-derives settlement receipts from Alpaca's own order history (startup + hourly + on demand). |
 | `main.py`      | 1 | FastAPI app, lifespan, HTTP surface. |
+| `tier0.py`     | — | The Tier-0 limits and `Decimal` sizing, shared by `execution.py` and the Risk & Routing agent. No I/O, no heavy imports. |
+| `risk_router/` | — | The Risk & Routing agent: the swarm's gatekeeper. See below. |
+| `swarm/`       | — | Ingestion, Quantitative and Inference agents, plus offline training of the return model. See below. |
+| `finbert_onnx.py` | — | FinBERT int8 ONNX loader without torch, shared by `inference.py` and the Inference Agent. |
+
+---
+
+## Risk & Routing agent (`risk_router/`)
+
+The first service of the multi-agent split, and the only one that places
+orders. Inference Agents send it signed `TradeSignal`s (`POST /v1/signals`).
+Each one passes the kill switch and the daily circuit breaker, then the
+portfolio limits, then `tier0.plan_buy`, and is submitted to Alpaca without
+blocking the event loop. A background monitor sells any position at its
+−5% stop or +10% target, which finally enforces the `engine_tracked` stops.
+
+| Guarantee | How |
+|---|---|
+| Every execution route is guarded | The guard is a dependency on the route *group* and runs again inside `_submit`, the one call that sends orders. A test sends a signed request to every `/v1` route while halted and expects 423. |
+| Breaker blocks new risk, never exits | `Intent.OPEN` vs `Intent.REDUCE`. It latches for the New York trading day and fails closed if P&L can't be read. |
+| No duplicate accumulation | No second entry while a position or buy order exists. Limits: $50 gross, 5 symbols, 10 buys a day, 4 h re-entry cooldown. All are read from Alpaca's own state at decision time. |
+| No race between concurrent signals | One `asyncio.Lock` spans the exposure read through the order's acknowledgement, and the service runs as exactly one replica. |
+| Non-blocking, at-most-once submission | `httpx.AsyncClient` against Alpaca's REST API. A timeout triggers a lookup by `client_order_id` (derived from the signal id) before any retry. |
+| Halt survives restarts | Stored on the StatefulSet's volume. Clearing it is a manual operator step. |
+
+```bash
+ROUTER_SIGNAL_SECRET=$(python3 -c 'import secrets;print(secrets.token_hex(32))') \
+  ./.venv/bin/uvicorn risk_router.app:app --port 8080
+```
+
+Deployment strategy, manifests and migration plan: [`deploy/k8s/README.md`](deploy/k8s/README.md).
+
+## The swarm (`swarm/`)
+
+```
+Alpaca news WS → Ingestion → news.raw → Quant → news.enriched → Inference → POST /v1/signals → Risk Router
+```
+
+| Agent | Does | Guarantees |
+|---|---|---|
+| **Ingestion** (`swarm/ingestion.py`) | Streams Alpaca news for the watchlist and backfills gaps over REST on every reconnect | Each article is published once (`SET NX` on its id). No gap between backfill and live, since it subscribes first. |
+| **Quant** (`swarm/quant.py`) | ATR, realised and Garman-Klass volatility, RSI, 5/20-day momentum, distance from the 20-day average, volume z-score, opening gap | Uses only sessions that had closed, and cleared the SIP delay, before the article was published |
+| **Inference** (`swarm/inference_agent.py`) | FinBERT on the headline + a calibrated scikit-learn model → `prob_up`, expected move | Sends only fresh signals that clear `tier0.ROUTER_MIN_PROB_UP`, and records every evaluation on `signals.evaluated` |
+
+The return model is trained on real Alpaca news and real 30-minute bars
+(`python -m swarm.train_return_model`, 33,312 article-symbol samples,
+2024-01 to 2026-09), with a time-ordered, purged train/calibrate/test
+split. The training labels, features and FinBERT scoring use the same
+functions the live agents use; tests check that they stay identical.
+
+**What it found, stated plainly** (full numbers in
+[`models/return_model/report.md`](models/return_model/report.md)):
+
+- A next-day horizon has no signal (test AUC 0.49). The same-session close
+  is the only horizon the calibration period selects on its own, and the
+  test period confirms it (AUC 0.524; 0.532 with one article per
+  symbol-day). The model is trained on that horizon, and the router trades
+  it: no entries in a session's last 30 minutes, everything sold in its
+  last 10.
+- The signal is in articles published **outside** market hours, entered at
+  the next open (AUC 0.549 calibration, 0.520 test). On articles the
+  router can act on intraday it is indistinguishable from noise (0.508),
+  and no probability threshold is profitable in both periods.
+- FinBERT sentiment alone is worse than chance out of sample. Momentum and
+  RSI carry what little the model knows.
+- So in practice the swarm evaluates everything and trades nothing: live
+  `prob_up` tops out around 0.45 against the router's 0.60. That is the
+  gatekeeper working as intended. The threshold should only come down with
+  evidence (a backtest), not to make it trade.
+
+`ORDERS_VIA_RISK_ROUTER=true` retires this service's own order placement
+once the router is live (see the migration plan).
 
 ---
 

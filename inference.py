@@ -41,6 +41,7 @@ import torch
 from pydantic import BaseModel, Field
 
 import broker
+import finbert_onnx
 from config import ConfigError
 
 logger = logging.getLogger(__name__)
@@ -61,10 +62,6 @@ FINBERT_ENABLED: Final[bool] = os.getenv("SENTIMENT_MODEL", "").strip().lower() 
 #: mirror; the label order must stay 0=positive, 1=negative, 2=neutral.
 FINBERT_REPO: Final[str] = os.getenv("SENTIMENT_MODEL_REPO", "Xenova/finbert").strip() or "Xenova/finbert"
 FINBERT_FILE: Final[str] = os.getenv("SENTIMENT_MODEL_FILE", "onnx/model_int8.onnx").strip() or "onnx/model_int8.onnx"
-#: BERT's positional limit is 512; a headline is a sentence. 128 bounds a
-#: pathological input's inference cost without ever truncating a real one.
-_FINBERT_MAX_TOKENS: Final[int] = 128
-
 MODEL_NAME: Final[str] = f"finbert-onnx-int8 ({FINBERT_REPO})" if FINBERT_ENABLED else PLACEHOLDER_MODEL_NAME
 _EMBEDDING_DIM: Final[int] = 64
 _NUM_LABELS: Final[int] = 3  # positive, negative, neutral
@@ -166,75 +163,26 @@ def _load_model() -> _PlaceholderFinBERT:
     return _PlaceholderFinBERT()
 
 
-@dataclass(frozen=True, slots=True)
-class _FinBERT:
-    """The real checkpoint: a fast tokenizer plus an ONNX Runtime session.
-
-    ``input_names`` is read off the graph rather than assumed — optimum's
-    BERT exports take ``input_ids``/``attention_mask``/``token_type_ids``,
-    but an alternative export may drop the third, and feeding an input the
-    graph does not declare is an error, not a no-op.
-    """
-
-    tokenizer: object
-    session: object
-    input_names: frozenset[str]
+#: Kept under its old private name: the real-model plumbing now lives in
+#: finbert_onnx.py, shared with the swarm's torch-free Inference Agent.
+_FinBERT = finbert_onnx.FinBERT
 
 
-@lru_cache(maxsize=1)
-def _load_finbert() -> _FinBERT:
+def _load_finbert() -> finbert_onnx.FinBERT:
     """Download (once, into the Hugging Face cache) and open the int8 graph.
 
-    Imported lazily so a placeholder deployment never pays for onnxruntime,
-    tokenizers or huggingface_hub at import time. ``main.py``'s startup
-    warmup is what triggers this, so a missing download fails the boot —
-    loudly, before the first real cycle — instead of the first order.
-    Memory: measured on Linux, the session adds ~+138 MB RSS on top of
-    whatever this process already carries (numbers in the README).
+    ``main.py``'s startup warmup is what triggers this, so a missing
+    download fails the boot — loudly, before the first real cycle —
+    instead of the first order. Memory: the session adds ~+138 MB RSS on
+    top of whatever this process already carries (numbers in the README).
     """
-    import onnxruntime as ort
-    from huggingface_hub import hf_hub_download
-    from tokenizers import Tokenizer
-
     logger.info("Loading sentiment model %s (%s)", MODEL_NAME, FINBERT_FILE)
-    model_path = hf_hub_download(FINBERT_REPO, FINBERT_FILE)
-    tokenizer_path = hf_hub_download(FINBERT_REPO, "tokenizer.json")
-
-    tokenizer = Tokenizer.from_file(tokenizer_path)
-    tokenizer.enable_truncation(_FINBERT_MAX_TOKENS)
-
-    options = ort.SessionOptions()
-    # One headline at a time on a fractional-CPU instance: thread pools
-    # only add contention and per-thread arenas here.
-    options.intra_op_num_threads = 1
-    options.inter_op_num_threads = 1
-    # ORT "prepacks" every MatMul weight into a second, kernel-optimised
-    # copy at session creation — a speed trade that costs memory this
-    # deployment cannot spare: measured on Linux, the 110 MB graph
-    # resident at +192 MB with prepacking and +138 MB without, for 11 ms
-    # vs 17 ms per headline. At one headline per cycle the 54 MB is the
-    # margin that keeps a 512 MB instance out of the OOM killer.
-    options.add_session_config_entry("session.disable_prepacking", "1")
-    session = ort.InferenceSession(model_path, options, providers=["CPUExecutionProvider"])
-    return _FinBERT(
-        tokenizer=tokenizer,
-        session=session,
-        input_names=frozenset(i.name for i in session.get_inputs()),
-    )
+    return finbert_onnx.load(FINBERT_REPO, FINBERT_FILE)
 
 
 def _finbert_logits(headline: str) -> np.ndarray:
     """Tokenise one headline and run the graph; returns the 3 raw logits."""
-    fb = _load_finbert()
-    encoding = fb.tokenizer.encode(headline)  # type: ignore[attr-defined]
-    feeds: dict[str, np.ndarray] = {
-        "input_ids": np.asarray([encoding.ids], dtype=np.int64),
-        "attention_mask": np.asarray([encoding.attention_mask], dtype=np.int64),
-        "token_type_ids": np.asarray([encoding.type_ids], dtype=np.int64),
-    }
-    feeds = {name: value for name, value in feeds.items() if name in fb.input_names}
-    (logits,) = fb.session.run(None, feeds)  # type: ignore[attr-defined]
-    return np.asarray(logits, dtype=np.float32)[0]
+    return finbert_onnx.logits(_load_finbert(), headline)
 
 
 def _embed(ticker: str, headline: str) -> torch.Tensor:

@@ -3,3 +3,8 @@
 #   ./.venv/bin/pytest
 pytest>=8.0
 pytest-asyncio>=0.24
+# Swarm agents (swarm/) and their tests. scikit-learn is pinned to the
+# version models/return_model/ was trained with.
+redis>=5.0
+fakeredis>=2.26
+scikit-learn==1.9.1
