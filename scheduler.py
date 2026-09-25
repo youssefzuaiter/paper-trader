@@ -56,7 +56,7 @@ import broker
 import execution
 import inference
 import webhook
-from config import ConfigError
+from config import ConfigError, orders_via_risk_router
 
 logger = logging.getLogger("tier0.scheduler")
 
@@ -132,7 +132,20 @@ async def run_signal_cycle(ticker: str, headline: str, *, submit: bool) -> dict[
     ``_log_event``/telemetry call either — only the primary Tier-0
     model's own ``signal`` decides what happens at the broker; the
     shadow model has no live effect of any kind.
+
+    A submitting cycle first passes ``_trading_block_reason`` — the kill
+    switch and the daily circuit breaker. Both used to be checked only in
+    ``trading_loop``, so ``POST /signals/execute`` kept placing orders
+    after an emergency halt or a -2.5% day.
     """
+    if submit:
+        block_reason = await _trading_block_reason()
+        if block_reason is not None:
+            code, detail = block_reason
+            logger.warning("Cycle BLOCKED %s: %s (%s)", ticker, code, detail)
+            _log_event("reject", ticker=ticker, status="blocked", details=f"{code}: {detail}")
+            return {"executed": False, "rejection": {"code": code, "detail": detail}}
+
     quote, signal, shadow_signal = await asyncio.gather(
         inference.fetch_quote(ticker),
         inference.predict_move(ticker, headline),
@@ -278,6 +291,27 @@ async def _fetch_daily_pnl_pct() -> Decimal | None:
     except Exception as exc:
         logger.warning("Could not fetch daily P&L for circuit breaker check: %s", exc)
         return None
+
+
+async def _trading_block_reason() -> tuple[str, str] | None:
+    """``(code, detail)`` when no new order may be submitted, else ``None``.
+
+    The same two checks, in the same order, as the top of ``trading_loop``
+    — shared so every submitting path applies them, not just the loop. An
+    unreadable P&L does not block, matching the loop's existing behaviour
+    (see ``_fetch_daily_pnl_pct``).
+    """
+    if orders_via_risk_router():
+        return "orders_moved", "order placement has moved to the Risk & Routing agent (ORDERS_VIA_RISK_ROUTER)"
+    if IS_HALTED:
+        return "halted", "emergency halt is active — restart the process to clear it"
+    pnl_pct = await _fetch_daily_pnl_pct()
+    if pnl_pct is not None and pnl_pct <= execution.CIRCUIT_BREAKER_DAILY_PNL_PCT:
+        return "circuit_breaker", (
+            f"daily P&L {pnl_pct:.2f}% is at/below the "
+            f"{execution.CIRCUIT_BREAKER_DAILY_PNL_PCT}% circuit breaker"
+        )
+    return None
 
 
 async def trading_loop() -> None:

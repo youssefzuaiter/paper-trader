@@ -1,0 +1,122 @@
+# Risk & Routing agent — the one pod that may place orders.
+#
+# A StatefulSet with replicas: 1, never a Deployment:
+#   * Singleton. Exposure checks and order submission are serialised by an
+#     in-process lock; two replicas would each pass the check and double-buy.
+#     A Deployment's rolling update briefly runs old and new pods side by
+#     side. A StatefulSet stops ordinal 0 before it starts the new ordinal 0.
+#   * Stable storage. The kill switch, the breaker latch and the receipt
+#     outbox live on a PVC that follows the pod across restarts and nodes.
+#     A halt that a pod restart could clear would not be a halt.
+# Do not scale this above 1.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: risk-router
+  namespace: paper-trader
+automountServiceAccountToken: false  # it never talks to the Kubernetes API
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: risk-router
+  namespace: paper-trader
+  labels: {app.kubernetes.io/name: risk-router, app.kubernetes.io/part-of: paper-trader}
+spec:
+  clusterIP: None  # headless: the StatefulSet's governing service; resolves to the one pod
+  selector: {app.kubernetes.io/name: risk-router}
+  ports:
+    - {name: http, port: 8080, targetPort: http}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: risk-router
+  namespace: paper-trader
+  labels: {app.kubernetes.io/name: risk-router, app.kubernetes.io/part-of: paper-trader}
+spec:
+  serviceName: risk-router
+  replicas: 1
+  podManagementPolicy: OrderedReady
+  updateStrategy: {type: RollingUpdate}
+  selector:
+    matchLabels: {app.kubernetes.io/name: risk-router}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: risk-router, app.kubernetes.io/part-of: paper-trader, trader.io/role: gatekeeper}
+    spec:
+      serviceAccountName: risk-router
+      terminationGracePeriodSeconds: 30  # lets an in-flight order get its acknowledgement
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: risk-router
+          image: paper-trader/risk-router:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - {name: http, containerPort: 8080}
+          env:
+            - {name: ROUTER_STATE_DIR, value: /app/state}
+            - name: ALPACA_API_KEY_ID
+              valueFrom: {secretKeyRef: {name: alpaca-paper, key: api-key-id}}
+            - name: ALPACA_API_SECRET_KEY
+              valueFrom: {secretKeyRef: {name: alpaca-paper, key: api-secret-key}}
+            - name: ROUTER_SIGNAL_SECRET  # inference → router
+              valueFrom: {secretKeyRef: {name: router-signal-hmac, key: secret}}
+            - name: WEBHOOK_SECRET        # PFW ↔ router (receipts out, control in)
+              valueFrom: {secretKeyRef: {name: pfw-webhook, key: secret}}
+            - name: WEBHOOK_URL
+              valueFrom: {configMapKeyRef: {name: pfw-endpoints, key: trades-url}}
+            - name: METRICS_WEBHOOK_URL
+              valueFrom: {configMapKeyRef: {name: pfw-endpoints, key: metrics-url}}
+          readinessProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests: {cpu: 50m, memory: 96Mi}
+            limits: {memory: 256Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          volumeMounts:
+            - {name: data, mountPath: /app/state, subPath: state}
+            - {name: data, mountPath: /app/outbox, subPath: outbox}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: tmp
+          emptyDir: {sizeLimit: 16Mi}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests: {storage: 256Mi}
+---
+# Only Inference Agents (and, for the control routes, the ingress
+# controller in front of PFW's calls) may reach the gatekeeper.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: risk-router-ingress
+  namespace: paper-trader
+spec:
+  podSelector:
+    matchLabels: {app.kubernetes.io/name: risk-router}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {trader.io/role: inference}
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: ingress-nginx}
+      ports:
+        - {port: 8080, protocol: TCP}

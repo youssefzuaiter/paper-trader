@@ -6,3 +6,6 @@ __pycache__/
 # Durable webhook outbox (outbox.py): the agent's own record of real
 # orders awaiting redelivery to PFW. Runtime state, never source.
 outbox/
+# Risk & Routing agent state (kill switch, breaker latch) when run locally.
+state/
+.cache/

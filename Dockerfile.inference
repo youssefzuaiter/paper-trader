@@ -1,0 +1,21 @@
+# Inference agent: FinBERT + the trained return model, both baked in.
+#   docker build -f Dockerfile.inference -t paper-trader/inference:0.1.0 .
+# The FinBERT graph is downloaded at BUILD time and the container runs with
+# the Hugging Face hub offline: a pod never starts on a half-downloaded
+# model, and the image tag pins both models (rollback = previous tag).
+FROM python:3.13-slim
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 HF_HOME=/opt/hf
+WORKDIR /app
+COPY swarm/requirements.txt swarm/requirements-inference.txt /tmp/
+RUN pip install -r /tmp/requirements-inference.txt && rm /tmp/requirements*.txt
+RUN python -c "from huggingface_hub import hf_hub_download as d; [d('Xenova/finbert', f) for f in ('onnx/model_int8.onnx', 'tokenizer.json')]"
+ENV HF_HUB_OFFLINE=1
+COPY config.py outbox.py webhook.py tier0.py finbert_onnx.py ./
+COPY risk_router/__init__.py risk_router/schemas.py risk_router/
+COPY swarm/__init__.py swarm/common.py swarm/alpaca_data.py swarm/features.py swarm/bus.py \
+     swarm/return_model.py swarm/inference_agent.py swarm/
+COPY models/return_model/ models/return_model/
+RUN useradd --uid 10001 --no-create-home --shell /usr/sbin/nologin agent
+USER 10001
+EXPOSE 8081
+CMD ["uvicorn", "swarm.inference_agent:app", "--host", "0.0.0.0", "--port", "8081", "--no-access-log"]

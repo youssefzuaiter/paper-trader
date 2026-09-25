@@ -1,0 +1,16 @@
+# Ingestion and Quantitative agents — one image, the Deployment picks the app:
+#   docker build -f Dockerfile.swarm -t paper-trader/swarm:0.1.0 .
+#   command: [uvicorn, swarm.ingestion:app, ...]  or  [uvicorn, swarm.quant:app, ...]
+# Explicit file list: .env, .venv, caches and model files never enter the image.
+FROM python:3.13-slim
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
+WORKDIR /app
+COPY swarm/requirements.txt /tmp/requirements.txt
+RUN pip install -r /tmp/requirements.txt && rm /tmp/requirements.txt
+COPY config.py tier0.py ./
+COPY swarm/__init__.py swarm/common.py swarm/alpaca_data.py swarm/features.py swarm/bus.py \
+     swarm/ingestion.py swarm/quant.py swarm/
+RUN useradd --uid 10001 --no-create-home --shell /usr/sbin/nologin agent
+USER 10001
+EXPOSE 8081
+CMD ["uvicorn", "swarm.quant:app", "--host", "0.0.0.0", "--port", "8081", "--no-access-log"]

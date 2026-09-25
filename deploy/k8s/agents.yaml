@@ -1,0 +1,179 @@
+# The three agent classes that feed the Risk Router.
+#   paper-trader/swarm:0.1.0      Dockerfile.swarm      (Ingestion, Quant)
+#   paper-trader/inference:0.1.0  Dockerfile.inference  (FinBERT + return model baked in)
+#
+#   Ingestion ──news.raw──▶ Quantitative ──news.enriched──▶ Inference ──POST /v1/signals──▶ Risk Router
+#
+# ---------------------------------------------------------------------------
+# Ingestion Agent: a singleton Deployment (replicas 1, Recreate).
+# It holds Alpaca's real-time news WebSocket. The free data plan limits
+# concurrent stream connections, so a rolling update that briefly ran two
+# pods would get one of them refused. Recreate stops the old pod first.
+# Stateless: it de-duplicates on Alpaca's news id with SET NX in Redis,
+# so a restart that replays recent news publishes nothing twice.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ingestion
+  namespace: paper-trader
+  labels: {app.kubernetes.io/name: ingestion, app.kubernetes.io/part-of: paper-trader}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app.kubernetes.io/name: ingestion}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: ingestion, app.kubernetes.io/part-of: paper-trader, trader.io/role: ingestion}
+    spec:
+      automountServiceAccountToken: false
+      securityContext: {runAsNonRoot: true, runAsUser: 10001, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: ingestion
+          image: paper-trader/swarm:0.1.0
+          imagePullPolicy: IfNotPresent
+          command: [uvicorn, swarm.ingestion:app, --host, 0.0.0.0, --port, "8081", --no-access-log]
+          ports:
+            - {name: http, containerPort: 8081}
+          readinessProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 15
+          livenessProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 30
+          env:
+            - {name: REDIS_URL, value: redis://redis-0.redis:6379/0}
+            - {name: WATCHLIST, value: "AAPL,MSFT,NVDA,TSLA,AMZN,GOOGL,META,AMD"}
+            - {name: BACKFILL_HOURS, value: "6"}
+            - name: ALPACA_API_KEY_ID
+              valueFrom: {secretKeyRef: {name: alpaca-paper, key: api-key-id}}
+            - name: ALPACA_API_SECRET_KEY
+              valueFrom: {secretKeyRef: {name: alpaca-paper, key: api-secret-key}}
+          resources:
+            requests: {cpu: 25m, memory: 64Mi}
+            limits: {memory: 128Mi}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: tmp
+          emptyDir: {sizeLimit: 16Mi}
+---
+# Quantitative Agent: a stateless Deployment that scales horizontally.
+# Replicas share one consumer group on news.raw, so each item is enriched
+# once. It pulls daily bars over REST (cached in Redis per symbol) and
+# emits ATR, realised and Garman-Klass volatility, RSI, momentum, distance
+# from the 20-day average, a volume z-score and the opening gap, all as of
+# the article's publication, on news.enriched.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: quant
+  namespace: paper-trader
+  labels: {app.kubernetes.io/name: quant, app.kubernetes.io/part-of: paper-trader}
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app.kubernetes.io/name: quant}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: quant, app.kubernetes.io/part-of: paper-trader, trader.io/role: quant}
+    spec:
+      automountServiceAccountToken: false
+      securityContext: {runAsNonRoot: true, runAsUser: 10001, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: quant
+          image: paper-trader/swarm:0.1.0
+          imagePullPolicy: IfNotPresent
+          command: [uvicorn, swarm.quant:app, --host, 0.0.0.0, --port, "8081", --no-access-log]
+          ports:
+            - {name: http, containerPort: 8081}
+          readinessProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 15
+          env:
+            - {name: REDIS_URL, value: redis://redis-0.redis:6379/0}
+            - {name: CONSUMER_GROUP, value: quant}
+            - name: CONSUMER_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - name: ALPACA_API_KEY_ID
+              valueFrom: {secretKeyRef: {name: alpaca-paper, key: api-key-id}}
+            - name: ALPACA_API_SECRET_KEY
+              valueFrom: {secretKeyRef: {name: alpaca-paper, key: api-secret-key}}
+          resources:
+            requests: {cpu: 50m, memory: 128Mi}
+            limits: {memory: 256Mi}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: tmp
+          emptyDir: {sizeLimit: 16Mi}
+---
+# Inference Agent: a stateless Deployment that scales on CPU.
+# Each pod runs FinBERT (int8 ONNX, ~140 MB resident) and the
+# scikit-learn return model side by side, then signs a TradeSignal to the
+# router when the calibrated up-probability clears the router's threshold. Model artifacts are baked into the image and
+# versioned by its tag: rollback is `kubectl rollout undo`, and no pod ever
+# serves a half-downloaded model. It needs no broker keys.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inference
+  namespace: paper-trader
+  labels: {app.kubernetes.io/name: inference, app.kubernetes.io/part-of: paper-trader}
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app.kubernetes.io/name: inference}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: inference, app.kubernetes.io/part-of: paper-trader, trader.io/role: inference}
+    spec:
+      automountServiceAccountToken: false
+      securityContext: {runAsNonRoot: true, runAsUser: 10001, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: inference
+          image: paper-trader/inference:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - {name: http, containerPort: 8081}
+          env:
+            - {name: REDIS_URL, value: redis://redis-0.redis:6379/0}
+            - {name: CONSUMER_GROUP, value: inference}
+            - name: CONSUMER_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - {name: RISK_ROUTER_URL, value: http://risk-router-0.risk-router:8080/v1/signals}
+            - name: ROUTER_SIGNAL_SECRET
+              valueFrom: {secretKeyRef: {name: router-signal-hmac, key: secret}}
+          startupProbe:  # model load + warmup inference before it takes traffic
+            httpGet: {path: /health, port: http}
+            periodSeconds: 5
+            failureThreshold: 24
+          readinessProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 250m, memory: 512Mi}
+            limits: {memory: 768Mi}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: tmp
+          emptyDir: {sizeLimit: 16Mi}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: inference
+  namespace: paper-trader
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: inference}
+  minReplicas: 2
+  maxReplicas: 4
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: {type: Utilization, averageUtilization: 70}
