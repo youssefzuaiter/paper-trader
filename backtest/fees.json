@@ -1,0 +1,22 @@
+{
+  "version": "2026-09-26b",
+  "note": "Regulatory fees on US equities as Alpaca passes them through, effective-dated. The open-ended rows are Alpaca's Brokerage Fee Schedule revised 2026-09-17, confirmed by the owner on 2026-09-26: SEC 0.0000206 x trade value (sells), FINRA TAF 0.000195 per share (sells, max 9.79 per trade), CAT 0.000003 per share (buys and sells). Earlier rows are the rates in force before them (SEC advisories, FINRA fee schedule). Rounding is the cost level's (D12, owner-confirmed): each fee type aggregated daily per account and rounded up to the cent at the optimistic and central levels, rounded up per order at the pessimistic level. Every fee type must be covered without gaps, and its last row is open-ended: a rate applies until the schedule changes. FINRA has scheduled TAF 0.000232 (max 11.61) from 2027-01-01; update when Alpaca's schedule does. Hashed into every experiment's manifest.",
+  "sources": {
+    "sec_fy2024": "https://www.sec.gov/rules-regulations/fee-rate-advisories/2024-2 (8.00 per million through 2024-05-21, 27.80 from 2024-05-22)",
+    "sec_fy2025": "https://www.sec.gov/rules-regulations/fee-rate-advisories/2025-2 (27.80 through 2025-05-13, 0.00 from 2025-05-14)",
+    "sec_fy2026": "https://www.sec.gov/rules-regulations/fee-rate-advisories/2026-2 (0.00 through 2026-04-03, 20.60 from 2026-04-04)",
+    "finra_taf": "https://www.finra.org/rules-guidance/rule-filings/sr-finra-2024-019/fee-adjustment-schedule (0.000166/share max 8.30 in 2024-2025; 0.000195 max 9.79 in 2026; from January 1 of each year)",
+    "alpaca_schedule": "https://files.alpaca.markets/disclosures/library/BrokFeeSched.pdf, revised 2026-09-17: SEC 0.0000206 x trade value, TAF 0.000195/share max 9.79, CAT 0.000003 per executed equivalent share on buys and sells; 'Each fee type is aggregated separately at the daily, per-account level. After aggregation, each fee total is rounded up to the nearest cent'",
+    "alpaca_support": "https://alpaca.markets/support/regulatory-fees, dated February 2026: SEC fee 'rounded up to the nearest penny'; TAF 'applied on a per-trade basis, rounded up to the nearest penny, and capped'",
+    "cat_history": "FINRA Rule 6897 lists industry-member CAT fees from September 2024 at 0.000009-0.000035 per share; how Alpaca passed them through before its current 0.000003 is not published, so the current rate is used throughout. At these order sizes the rate is immaterial next to rounding."
+  },
+  "fees": [
+    {"fee": "sec", "side": "sell", "basis": "principal", "rate": "0.000008", "cap": null, "from": "2023-02-27", "to": "2024-05-21"},
+    {"fee": "sec", "side": "sell", "basis": "principal", "rate": "0.0000278", "cap": null, "from": "2024-05-22", "to": "2025-05-13"},
+    {"fee": "sec", "side": "sell", "basis": "principal", "rate": "0", "cap": null, "from": "2025-05-14", "to": "2026-04-03"},
+    {"fee": "sec", "side": "sell", "basis": "principal", "rate": "0.0000206", "cap": null, "from": "2026-04-04", "to": null},
+    {"fee": "taf", "side": "sell", "basis": "shares", "rate": "0.000166", "cap": "8.30", "from": "2024-01-01", "to": "2025-12-31"},
+    {"fee": "taf", "side": "sell", "basis": "shares", "rate": "0.000195", "cap": "9.79", "from": "2026-01-01", "to": null},
+    {"fee": "cat", "side": "both", "basis": "shares", "rate": "0.000003", "cap": null, "from": "2024-01-01", "to": null}
+  ]
+}
