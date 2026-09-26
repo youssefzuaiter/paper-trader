@@ -44,6 +44,11 @@ _HISTORY: Final[timedelta] = timedelta(days=75)
 _CACHE_TTL_SECONDS: Final[int] = 30 * 60
 
 
+def atr_usd(features: dict[str, float], last_session: Bar) -> float:
+    """The 14-day ATR in dollars of ``last_session``'s close, as signals carry it."""
+    return round(features["atr14_pct"] / 100 * last_session.c, 4)
+
+
 class QuantAgent:
     def __init__(self, redis: Redis, data: AlpacaData, *,
                  now: Callable[[], datetime] = lambda: datetime.now(UTC)) -> None:
@@ -87,7 +92,7 @@ class QuantAgent:
                 "features": features,
                 # For the router's volatility-parity sizing (dollars, not a
                 # model input). It can only ever shrink an order.
-                "atr_usd": round(features["atr14_pct"] / 100 * history[-1].c, 4),
+                "atr_usd": atr_usd(features, history[-1]),
             })
             self.enriched += 1
 

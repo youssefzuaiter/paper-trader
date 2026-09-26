@@ -98,6 +98,11 @@ FIRST_REGULAR_BAR: Final[time] = time(9, 30)
 LAST_REGULAR_BAR: Final[time] = time(15, 30)
 GATE_THRESHOLDS: Final[tuple[float, ...]] = (0.40, 0.45, 0.50, 0.55, 0.60)
 MOVE_BINS: Final[int] = 10
+#: Fixed, not tuned (the backtester's D11): any change is a registered experiment.
+GBM_PARAMS: Final[dict[str, Any]] = {
+    "learning_rate": 0.05, "max_iter": 300, "max_leaf_nodes": 15, "min_samples_leaf": 200,
+    "l2_regularization": 1.0, "early_stopping": False, "random_state": 7,
+}
 
 
 # --- data -------------------------------------------------------------------------
@@ -280,9 +285,9 @@ def score_headlines(headlines: list[str], cache: Path, workers: int) -> dict[str
 
 # --- training & evaluation ----------------------------------------------------------
 
-def split(ts: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def split(ts: np.ndarray, purge_gap: timedelta = PURGE) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     cut1, cut2 = np.quantile(ts, [0.6, 0.8])
-    purge = PURGE.total_seconds()
+    purge = purge_gap.total_seconds()
     train = ts < cut1 - purge
     calib = (ts >= cut1) & (ts < cut2 - purge)
     test = ts >= cut2
@@ -326,7 +331,27 @@ def _gate(ds: Dataset, mask: np.ndarray, probs: np.ndarray) -> list[dict[str, An
     return rows
 
 
-def train_and_evaluate(ds: Dataset) -> tuple[Any, dict[str, Any]]:
+def fit_calibrated(X_train: np.ndarray, y_train: np.ndarray, X_calib: np.ndarray,
+                   y_calib: np.ndarray) -> CalibratedClassifierCV:
+    """The one estimator: the gradient-boosted classifier fit on the training
+    segment, sigmoid-calibrated on the calibration segment. Training and the
+    backtester's walk-forward both call this; neither re-implements it."""
+    gbm = HistGradientBoostingClassifier(**GBM_PARAMS).fit(X_train, y_train)
+    return CalibratedClassifierCV(FrozenEstimator(gbm), method="sigmoid").fit(X_calib, y_calib)
+
+
+def move_table(prob_up: np.ndarray, fwd: np.ndarray, bins: int = MOVE_BINS) -> dict[str, list[float]]:
+    """Mean forward return (%) per predicted-probability bin: what
+    ``ReturnModel.predict`` serves as the expected move. Bin edges are the
+    interior quantiles of ``prob_up``; a value on an edge falls in the
+    upper bin, as ``bisect_right`` puts it when serving."""
+    edges = np.unique(np.quantile(prob_up, np.linspace(0, 1, bins + 1))[1:-1])
+    index = np.searchsorted(edges, prob_up, side="right")
+    means = [float(fwd[index == b].mean() * 100) if (index == b).any() else 0.0 for b in range(len(edges) + 1)]
+    return {"edges": [float(e) for e in edges], "mean_return_pct": means}
+
+
+def train_and_evaluate(ds: Dataset, *, purge: timedelta = PURGE) -> tuple[Any, dict[str, Any]]:
     """Fit on train, calibrate on calibrate, report on test.
 
     Trained on every article (overnight ones included, with
@@ -340,7 +365,7 @@ def train_and_evaluate(ds: Dataset) -> tuple[Any, dict[str, Any]]:
     regression on the first model collapsed almost every prediction onto
     one plateau (the 10th-90th percentile of prob_up were all 0.444).
     """
-    train, calib, test = split(ds.ts)
+    train, calib, test = split(ds.ts, purge)
     Xtr, ytr, Xca, yca, Xte, yte = ds.X[train], ds.y[train], ds.X[calib], ds.y[calib], ds.X[test], ds.y[test]
     base_rate = float(ytr.mean())
 
@@ -348,11 +373,7 @@ def train_and_evaluate(ds: Dataset) -> tuple[Any, dict[str, Any]]:
     baseline = LogisticRegression().fit(Xtr[:, [sent_net]], ytr)
     p_baseline = baseline.predict_proba(Xte[:, [sent_net]])[:, 1]
 
-    gbm = HistGradientBoostingClassifier(
-        learning_rate=0.05, max_iter=300, max_leaf_nodes=15, min_samples_leaf=200,
-        l2_regularization=1.0, early_stopping=False, random_state=7,
-    ).fit(Xtr, ytr)
-    model = CalibratedClassifierCV(FrozenEstimator(gbm), method="sigmoid").fit(Xca, yca)
+    model = fit_calibrated(Xtr, ytr, Xca, yca)
     p_test = model.predict_proba(Xte)[:, 1]
 
     calib_t, test_t = calib & ds.tradeable, test & ds.tradeable
@@ -406,11 +427,7 @@ def train_and_evaluate(ds: Dataset) -> tuple[Any, dict[str, Any]]:
     ))
 
     # Expected move per probability bin: tradeable CALIBRATION articles only.
-    edges = np.unique(np.quantile(p_calib_t, np.linspace(0, 1, MOVE_BINS + 1))[1:-1])
-    bins = np.searchsorted(edges, p_calib_t, side="right")
-    fwd_ca = ds.fwd[calib_t]
-    means = [float(fwd_ca[bins == b].mean() * 100) if (bins == b).any() else 0.0 for b in range(len(edges) + 1)]
-    metrics["move_table"] = {"edges": [float(e) for e in edges], "mean_return_pct": means}
+    metrics["move_table"] = move_table(p_calib_t, ds.fwd[calib_t])
     return model, metrics
 
 

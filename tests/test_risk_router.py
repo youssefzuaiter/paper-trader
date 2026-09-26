@@ -599,6 +599,38 @@ def test_client_refuses_a_non_paper_host(monkeypatch: pytest.MonkeyPatch) -> Non
         AsyncAlpaca("key", "secret")
 
 
+def test_live_router_gates_on_the_tier0_constant(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Backtester D2: the gate is a constructor argument only so the
+    backtester can test lower thresholds. The live wiring must not pass it."""
+    import inspect
+
+    from risk_router.app import build_router_from_env
+
+    assert inspect.signature(RiskRouter).parameters["min_prob_up"].default is tier0.ROUTER_MIN_PROB_UP
+    monkeypatch.setenv("ALPACA_API_KEY_ID", "key")
+    monkeypatch.setenv("ALPACA_API_SECRET_KEY", "secret")
+    monkeypatch.setenv("ROUTER_STATE_DIR", str(tmp_path))
+    config.get_broker_settings.cache_clear()
+    try:
+        router = build_router_from_env()
+        assert router.min_prob_up is tier0.ROUTER_MIN_PROB_UP
+        asyncio.run(router.alpaca.aclose())
+    finally:
+        config.get_broker_settings.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_an_offline_router_can_gate_lower(fake: FakeAlpaca, state_path: Path) -> None:
+    alpaca = AsyncAlpaca("key", "secret", transport=httpx.MockTransport(fake.handler), sleep=_no_sleep)
+    state = StateStore(state_path)
+    router = RiskRouter(alpaca, ExecutionGuard(state, CircuitBreaker(alpaca, state)), min_prob_up=Decimal("0.45"))
+    assert (await router.handle_signal(_signal(prob_up=0.46))).decision == "accepted"
+    rejected = await router.handle_signal(_signal("AAPL", "sig-00000002", prob_up=0.44))
+    assert (rejected.decision, rejected.code) == ("rejected", "below_min_prob")
+    with pytest.raises(ValueError):
+        RiskRouter(alpaca, router.guard, min_prob_up=Decimal("1.5"))
+
+
 def test_guard_intent_matrix(state_path: Path, fake: FakeAlpaca) -> None:
     router = _router(fake, state_path)
     # REDUCE never consults the breaker, so it passes even with P&L unreadable.

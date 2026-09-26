@@ -78,5 +78,8 @@ class ReturnModel:
         """
         x = np.asarray([row], dtype=float)
         prob_up = float(self.classifier.predict_proba(x)[0, 1])
-        expected = self.move_bin_means[bisect_right(self.move_bin_edges, prob_up)]
-        return prob_up, float(expected)
+        return prob_up, self.expected_move(prob_up)
+
+    def expected_move(self, prob_up: float) -> float:
+        """The move table's mean for ``prob_up``'s bin (upper bin on an edge)."""
+        return float(self.move_bin_means[bisect_right(self.move_bin_edges, prob_up)])

@@ -128,14 +128,15 @@ class AlpacaData:
 
     async def bars(
         self, symbols: Sequence[str], *, timeframe: str, start: datetime, end: datetime | None = None,
-        feed: str = "sip",
+        feed: str = "sip", adjustment: str = "all",
     ) -> dict[str, list[Bar]]:
-        """Split- and dividend-adjusted bars per symbol, oldest first."""
+        """Bars per symbol, oldest first: split- and dividend-adjusted unless
+        ``adjustment="raw"`` (the backtester fills orders at raw prices)."""
         latest_allowed = datetime.now(UTC) - SIP_DELAY
         end = min(end or latest_allowed, latest_allowed)
         params: dict[str, Any] = {
             "symbols": ",".join(symbols), "timeframe": timeframe, "start": _rfc3339(start),
-            "end": _rfc3339(end), "feed": feed, "adjustment": "all", "limit": 10_000, "sort": "asc",
+            "end": _rfc3339(end), "feed": feed, "adjustment": adjustment, "limit": 10_000, "sort": "asc",
         }
         out: dict[str, list[Bar]] = {s: [] for s in symbols}
         while True:
