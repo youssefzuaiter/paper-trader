@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import math
 from bisect import bisect_right
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -89,13 +90,17 @@ class BarSeries:
     def __len__(self) -> int:
         return len(self.start)
 
+    # Bar starts are whole seconds (int64). Searching them with a float would make numpy
+    # cast the whole array on every call; rounding the bound the safe way is exact instead.
+
     def first_at_or_after(self, epoch: float) -> int:
         """Index of the first bar starting at or after ``epoch`` (``len`` if none)."""
-        return int(np.searchsorted(self.start, epoch, side="left"))
+        return int(np.searchsorted(self.start, np.int64(math.ceil(epoch)), side="left"))
 
     def last_ended_by(self, epoch: float) -> int:
-        """Index of the last bar that ended at or before ``epoch`` (-1 if none)."""
-        return int(np.searchsorted(self.start + self.seconds, epoch, side="right")) - 1
+        """Index of the last bar that ended at or before ``epoch`` (-1 if none):
+        ``start + seconds <= epoch``, searched without building ``start + seconds``."""
+        return int(np.searchsorted(self.start, np.int64(math.floor(epoch - self.seconds)), side="right")) - 1
 
     def session_last(self, i: int) -> int:
         """Index of the last bar in bar ``i``'s session."""

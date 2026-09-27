@@ -30,7 +30,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import pickle
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal
@@ -228,6 +228,42 @@ def central_cost(fees: costs.FeeTable, notional: Decimal, calendar: Calendar) ->
     return cost
 
 
+def fold_thresholds(samples: Samples, calib: np.ndarray, prob_calib: np.ndarray, cost_fn: CostFn) -> tuple[
+        dict[str, float | None], dict[str, list[dict[str, Any]]], dict[str, dict[str, list[float]]]]:
+    """Per strategy, from the calibration segment only (P6): the threshold rule's
+    choice, its whole grid, and the move table. Only the threshold depends on cost."""
+    thresholds: dict[str, float | None] = {}
+    grids: dict[str, list[dict[str, Any]]] = {}
+    tables: dict[str, dict[str, list[float]]] = {}
+    for name in STRATEGIES:
+        collapsed = name.endswith("_collapsed")
+        if name.startswith("S2"):
+            units = s2_nights(samples, calib, prob_calib, collapsed=collapsed)
+        else:
+            units = s3_events(samples, calib, prob_calib, collapsed=collapsed)
+        if len(units["score"]) == 0:
+            thresholds[name], grids[name] = None, []
+            tables[name] = {"edges": [], "mean_return_pct": [0.0]}
+            continue
+        unit_cost = cost_fn(samples, units["first"])
+        thresholds[name], grids[name] = threshold_rule(units, unit_cost,
+                                                       per_symbol_day_first=name.startswith("S3"))
+        tables[name] = move_table(units["score"], units["ret"])
+    return thresholds, grids, tables
+
+
+def at_cost(samples: Samples, folds: Sequence[FoldResult], cost_fn: CostFn) -> list[FoldResult]:
+    """The same fitted folds with thresholds re-chosen under another cost (another
+    order size, D3): models, calibration and move tables are unchanged."""
+    out = []
+    for f in folds:
+        thresholds, grids, tables = fold_thresholds(samples, f.calib, f.prob_calib, cost_fn)
+        if tables != f.move_tables:
+            raise AssertionError("move tables must not depend on cost")
+        out.append(replace(f, thresholds=thresholds, grids=grids))
+    return out
+
+
 def fit_fold(samples: Samples, bounds: FoldBounds, schedule: Schedule, cost_fn: CostFn) -> FoldResult:
     made, resolved = samples.made_at, samples.resolved_at
     window = resolved < bounds.embargo_cutoff.timestamp()
@@ -246,26 +282,12 @@ def fit_fold(samples: Samples, bounds: FoldBounds, schedule: Schedule, cost_fn: 
     prob_calib = model.predict_proba(samples.X[calib])[:, 1]
     prob_scored = model.predict_proba(samples.X[scored])[:, 1] if len(scored) else np.empty(0)
 
-    thresholds: dict[str, float | None] = {}
-    grids: dict[str, list[dict[str, Any]]] = {}
-    tables: dict[str, dict[str, list[float]]] = {}
-    for name in STRATEGIES:
-        collapsed = name.endswith("_collapsed")
-        if name.startswith("S2"):
-            units = s2_nights(samples, calib, prob_calib, collapsed=collapsed)
-        else:
-            units = s3_events(samples, calib, prob_calib, collapsed=collapsed)
-        if len(units["score"]) == 0:
-            thresholds[name], grids[name] = None, []
-            tables[name] = {"edges": [], "mean_return_pct": [0.0]}
-            continue
-        unit_cost = cost_fn(samples, units["first"])
-        thresholds[name], grids[name] = threshold_rule(units, unit_cost,
-                                                       per_symbol_day_first=name.startswith("S3"))
-        tables[name] = move_table(units["score"], units["ret"])
-
+    thresholds, grids, tables = fold_thresholds(samples, calib, prob_calib, cost_fn)
     digest = _hash_arrays(samples.X[train], samples.y[train], samples.X[calib], samples.y[calib],
                           extra=repr(sorted(GBM_PARAMS.items())))
+    # The exact pickled artifact. It embeds the OpenMP thread count (in the model's _BinMapper), so two
+    # artifacts compare only at the same OMP_NUM_THREADS; every experiment records it. Predictions do not
+    # depend on it (verified bit for bit at 1, 2 and 8 threads).
     artifact = hashlib.sha256(pickle.dumps(model, protocol=5)).hexdigest()
     y_cal = samples.y[calib]
     auc = float(roc_auc_score(y_cal, prob_calib)) if 0 < y_cal.sum() < len(y_cal) else None

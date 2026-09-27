@@ -91,6 +91,19 @@ def verify(recorded: Mapping[str, Any], root: Path) -> None:
             raise ManifestMismatch(f"{f['path']} changed since the experiment recorded it")
 
 
+def code_hash(repo: Path = ROOT) -> str:
+    """One hash of every tracked and untracked (not ignored) file as it is on disk:
+    it identifies a dirty tree's exact code, and equals a clean re-run's after commit."""
+    names = sorted(set(git(repo, "ls-files").splitlines())
+                   | set(git(repo, "ls-files", "--others", "--exclude-standard").splitlines()))
+    h = hashlib.sha256()
+    for name in names:
+        path = repo / name
+        if path.is_file():
+            h.update(f"{name}\0{sha256_file(path)}\n".encode())
+    return h.hexdigest()
+
+
 def environment() -> dict[str, Any]:
     import duckdb
     import joblib
@@ -152,7 +165,7 @@ def begin(store: Store, *, hypothesis: str, command: str, params: Mapping[str, A
         "command": command, "parent_id": parent_id, "status": "running", "window_start": window[0] if window else None,
         "window_end": window[1] if window else None, "lockbox": lockbox, "git_commit": commit, "git_dirty": dirty,
         "data_hash": files["hash"], "manifest": files, "params": dict(params), "seeds": dict(seeds),
-        "environment": environment(),
+        "environment": {**environment(), "code_hash": code_hash(repo)},
     })
     return Experiment(store, experiment_id, command, dict(params))
 

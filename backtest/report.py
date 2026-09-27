@@ -207,3 +207,90 @@ def strategy_report(summaries: Sequence[Summary], *, configuration: tuple[int, i
     if notes:
         lines += ["", *(f"- {note}" for note in notes)]
     return "\n".join(lines) + "\n"
+
+
+# --- the full run: every strategy, level and size, and the registered pass rule -----------------------
+
+def _pct(x: float) -> str:
+    return f"{x:+.2%}"
+
+
+def _interval(i: metrics.Interval, fmt: str = "{:+.4%}") -> str:
+    return f"{fmt.format(i.estimate)} [{fmt.format(i.low)}, {fmt.format(i.high)}]"
+
+
+def series_row(s: Any, *, resamples: int, seed: int) -> dict[str, Any]:
+    """The §10 metrics of one daily series."""
+    r = s.returns
+    depth, duration = metrics.max_drawdown(r)
+    return {"total": float(r.sum()), "annualised": float(r.mean() * metrics.TRADING_DAYS) if len(r) else 0.0,
+            "sharpe": metrics.block_bootstrap(r, metrics.sharpe, n=resamples, seed=seed),
+            "max_drawdown": depth, "drawdown_days": duration}
+
+
+def excess_interval(s: Any, benchmark: Any, *, resamples: int, seed: int) -> metrics.Interval:
+    b = benchmark.by_date()
+    return metrics.block_bootstrap(np.array([x - b[d] for d, x in zip(s.dates, s.returns, strict=True)]), np.mean,
+                                   n=resamples, seed=seed)
+
+
+def run_report(*, window: tuple[date, date], criteria: Mapping[str, Any], criteria_id: str, walkforward_id: str,
+               assessment: Mapping[str, Any],
+               table: Mapping[str, Mapping[str, Any]], bets: Mapping[str, Mapping[str, int]],
+               rejections: Mapping[str, Mapping[str, int]], placebo: Mapping[str, Mapping[str, float]],
+               costs_by_run: Mapping[str, Mapping[str, float]], walkforward_summary: Sequence[str],
+               notes: Sequence[str]) -> str:
+    size = assessment["size_usd"]
+    lines = [f"# S0-S3 and the baselines, {window[0].isoformat()} to {window[1].isoformat()}", "", SELECTION_BIAS, "",
+             (f"Walk-forward: experiment `{walkforward_id}`. Pass rule and order size: experiment `{criteria_id}`, "
+             "registered before any strategy ran; nothing below changed after results were seen."), "",
+             "## Verdict against the registered pass rule", "", f"> {criteria['pass_rule']}", "",
+             (f"**{assessment['verdict'].capitalize()}.** Evaluated at the registered order size, ${size}. "
+             f"Lock-box: {assessment['lockbox']}."), "",
+             ("| Level | Variant | Mean daily excess over B1 [95%] | Above zero | Every half-year positive | "
+             "Symbol-nights (≥ 300) | Passes |"),
+             "|---|---|---|:---:|:---:|---:|:---:|"]
+    for level, variants in assessment["levels"].items():
+        for variant, c in variants.items():
+            i = c["mean_daily_excess"]
+            lines.append(f"| {level} | {variant} | {i['estimate']:+.4%} [{i['low']:+.4%}, {i['high']:+.4%}] | "
+                         f"{'✓' if c['checks']['interval_above_zero'] else '✗'} | "
+                         f"{'✓' if c['checks']['positive_each_half_year'] else '✗'} | {c['symbol_nights']} | "
+                         f"{'**yes**' if c['passes'] else 'no'} |")
+    halves = assessment["levels"]["central"]["S2"]["half_years"]
+    lines += ["", "Central, S2, mean daily excess over B1 by half-year: "
+              + ", ".join(f"{h} {m:+.4%}" for h, m in halves.items()) + "."]
+    for label in sorted({k.split("|")[2] for k in table}, key=lambda s: Decimal(s)):
+        lines += ["", f"## Every strategy at ${label} an order", "",
+                  ("| Strategy | Level | Total | Annualised | Sharpe [95%] | Max drawdown (days) | vs S0 [95%] | "
+                  "vs B1 [95%] | vs B2 [95%] | In B3 |"),
+                  "|---|---|---:|---:|---|---|---|---|---|---:|"]
+        for key, row in table.items():
+            name, level, sz = key.split("|")
+            if sz != label:
+                continue
+            sh = row["sharpe"]
+            lines.append(f"| {name} | {level} | {_pct(row['total'])} | {_pct(row['annualised'])} | "
+                         f"{sh.estimate:.2f} [{sh.low:.2f}, {sh.high:.2f}] | {row['max_drawdown']:.2%} "
+                         f"({row['drawdown_days']}) | {_cell(row.get('vs_S0'))} | {_cell(row.get('vs_B1'))} | "
+                         f"{_cell(row.get('vs_B2'))} | {_placebo(placebo.get(key))} |")
+    lines += ["", "## Independent bets, costs and rejections", "",
+              "| Run | Days with a position | Symbol-days | Trades | Spread | Slippage | Fees | Rejections |",
+              "|---|---:|---:|---:|---:|---:|---:|---|"]
+    for key in sorted(bets):
+        b, c = bets[key], costs_by_run.get(key, {})
+        rej = ", ".join(f"{k} {v}" for k, v in sorted(rejections.get(key, {}).items())) or "—"
+        lines.append(f"| {key.replace('|', ' ')} | {b['days_with_a_position']} | {b['symbol_days']} | {b['trades']} | "
+                     f"${c.get('spread_cost', 0):,.2f} | ${c.get('slippage_cost', 0):,.2f} | ${c.get('fees', 0):,.2f} "
+                     f"| {rej} |")
+    lines += ["", "## The walk-forward behind S2 and S3", "", *walkforward_summary, "", "## Notes", "",
+              *(f"- {n}" for n in notes), ""]
+    return "\n".join(lines)
+
+
+def _cell(i: metrics.Interval | None) -> str:
+    return "—" if i is None else f"{i.estimate:+.4%} [{i.low:+.4%}, {i.high:+.4%}]"
+
+
+def _placebo(p: Mapping[str, float] | None) -> str:
+    return "—" if not p else f"{p['percentile']:.0f}th"

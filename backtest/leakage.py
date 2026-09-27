@@ -135,20 +135,26 @@ def shuffle_labels(samples: Samples, seed: int) -> Samples:
 
 def shuffled_auc(samples: Samples, schedule: Schedule, calendar: Calendar, cost_fn: CostFn, *,
                  seeds: Sequence[int], bootstrap: int = 1000) -> Check:
-    """With labels shuffled, the walk-forward's AUC interval must contain 0.5.
-    At 95%, one seed in twenty misses by chance: at most 2 of 10 may, and
-    their mean must be within 0.01 of 0.5."""
-    per_seed = []
+    """With labels shuffled, the walk-forward's AUC interval must contain 0.5."""
+    runs = []
     for seed in seeds:
         shuffled = shuffle_labels(samples, seed)
-        folds = walkforward.run(shuffled, schedule, calendar, cost_fn)
+        runs.append((seed, shuffled, walkforward.run(shuffled, schedule, calendar, cost_fn)))
+    return auc_contains_half(runs, bootstrap=bootstrap)
+
+
+def auc_contains_half(runs: Sequence[tuple[int, Samples, Sequence[FoldResult]]], *, bootstrap: int = 1000) -> Check:
+    """At 95%, one seed in twenty misses by chance: at most 2 of 10 may, and the
+    seeds' mean AUC must be within 0.01 of 0.5."""
+    per_seed = []
+    for seed, shuffled, folds in runs:
         idx = np.concatenate([f.scored for f in folds])
         prob = np.concatenate([f.prob_scored for f in folds])
         interval = bootstrap_auc(shuffled.y[idx], prob, shuffled.session[idx], n=bootstrap, seed=seed)
         per_seed.append({"seed": seed, **interval.as_dict(), "contains_half": interval.contains(0.5)})
     misses = sum(not s["contains_half"] for s in per_seed)
     mean = float(np.mean([s["estimate"] for s in per_seed]))
-    allowed = max(1, round(0.2 * len(seeds))) if len(seeds) >= 5 else 0
+    allowed = max(1, round(0.2 * len(runs))) if len(runs) >= 5 else 0
     return Check("L2-auc", misses <= allowed and abs(mean - 0.5) < 0.01,
                  {"seeds": per_seed, "misses": misses, "allowed": allowed, "mean_auc": mean})
 

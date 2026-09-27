@@ -364,10 +364,14 @@ Decided by the owner after review. These override the defaults above wherever th
 | D2 | **Yes, backtest only.** The router's `prob_up` gate becomes a constructor argument defaulting to `tier0.ROUTER_MIN_PROB_UP` (0.60). The live app never passes it, and a test asserts that the live router's threshold equals the constant. Every other risk limit stays hardcoded. |
 | D3 | **Report both, decide later.** Every report shows results at $10 (the Tier-0 cap) and at a second, configurable order size. The owner fixes that real-money size, and registers it with the D5 pass criteria, **before the first S2 result is read**. |
 | D4–D11 | **Accepted as recommended** in section 12. |
+| D10 (placement) | **`requirements-dev.txt`, not `requirements.txt`** (2026-09-26): DuckDB is declared beside scikit-learn, which the backtester already needs from there. No service image imports it. |
+| D12 | **Fee rounding** (2026-09-26): Alpaca's Brokerage Fee Schedule revised 2026-09-17 aggregates each fee type daily per account, then rounds the total up to the cent. That rule applies at the optimistic and central levels; the pessimistic level keeps rounding each fee type up per order. Rates in force: SEC $0.0000206 × trade value (sells), FINRA TAF $0.000195 per share (sells, max $9.79 per trade), CAT $0.000003 per share (buys and sells). Earlier effective-dated rates apply to earlier trades (`backtest/fees.json`). |
+| Threshold fees | **The threshold rule charges fees rounded per order** (2026-09-26): its central round-trip cost (section 6) uses per-order rounding at the order size, whatever the level's own rounding, so a threshold never depends on how many other trades share a day's rounding. |
 
 **Verified fact for section 3 and item 4 of section 11** (Alpaca's regulatory-fees support page,
 dated February 2026, read 2026-09-25): the SEC fee is "rounded up to the nearest penny" and the
 FINRA TAF is "applied on a per-trade basis, rounded up to the nearest penny, and capped", both on
 sales only. A CAT fee also applies, on buys and sells. Rates and caps still need filling from the
 SEC and FINRA pages at build start. So a $10 sale pays at least $0.01 of TAF (10 bps), plus $0.01
-of SEC fee whenever the Section 31 rate is above zero.
+of SEC fee whenever the Section 31 rate is above zero. *(Superseded for the optimistic and
+central levels by D12: the fee schedule revised 2026-09-17 rounds daily per fee type.)*

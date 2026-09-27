@@ -159,6 +159,8 @@ def test_reproduce_reruns_the_commit_and_matches_bit_for_bit(tmp_path: Path) -> 
     with Store(store_path) as store:
         (original,) = store.experiments(command="legacy")
     assert original["status"] == "done" and not original["git_dirty"]
+    assert (tmp_path / "reports" / f"{original['experiment_id']}-legacy-reproduction.md").exists()
+    assert not (ROOT / ".cache" / "backtest" / "reports" / f"{original['experiment_id']}-legacy-reproduction.md").exists()
 
     out = subprocess.run([sys.executable, "-m", "backtest", "reproduce", original["experiment_id"], *common],
                          cwd=repo, env=env, check=True, capture_output=True, text=True).stdout

@@ -5,12 +5,15 @@ registers an experiment before computing anything (design §8).
     legacy              reproduce models/return_model/report.md (L4, L4b and their twins)
     leakage             the leakage checks that need no strategy run, on real data
     register-criteria   the owner's D3 order size and D5 pass criteria, before any S2 result
+    walkforward         the monthly walk-forward: models, predictions, outcomes, thresholds per size
+    leakage-wf          L1, L2, L5, L6 and L8 on the real walk-forward, each beside its twin
+    run                 S0-S3 and B1-B3 at three cost levels and both sizes; the registered pass rule
     experiments         the registry, newest last
     reproduce ID        re-run an experiment from its commit; identical metrics and report hash or fail
 
-Reports go to ``.cache/backtest/reports/``. The real walk-forward and the
-strategy runs are wired next, behind ``registered_criteria``: nothing reads
-an S2 result before the owner's order size and pass criteria are registered.
+Reports go to ``.cache/backtest/reports/``. ``walkforward``, ``leakage-wf``
+and ``run`` refuse to start until the owner's order size and pass criteria
+are registered: nothing reads an S2 result before the pass rule exists.
 """
 
 from __future__ import annotations
@@ -24,13 +27,14 @@ from collections import Counter
 from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from functools import partial
 from pathlib import Path
 from typing import Any, Final
 
 import numpy as np
 
 from backtest import events as ev
-from backtest import leakage, registry
+from backtest import leakage, registry, runs
 from backtest import report as reports
 from backtest.calendar import Calendar
 from backtest.data import (
@@ -65,7 +69,8 @@ def _write_report(root: Path, experiment: registry.Experiment, name: str, body: 
     n, m = registry.configuration(store, experiment.experiment_id)
     header = {"experiment": experiment.experiment_id, "command": experiment.command,
               "written": datetime.now(UTC).isoformat(timespec="seconds"), "configuration": f"{n} of {m}"}
-    folder = _paths(root)[0] / "reports"
+    # Beside the registry that references them: a test's temporary store keeps its reports to itself.
+    folder = (Path(store.path).parent if store.path != ":memory:" else _paths(root)[0]) / "reports"
     folder.mkdir(parents=True, exist_ok=True)
     text = reports.document(header, body)
     (folder / f"{experiment.experiment_id}-{name}.md").write_text(text, encoding="utf-8")
@@ -308,11 +313,16 @@ def registered_criteria(store: Store) -> dict[str, Any]:
 
 COMMANDS: Final[dict[str, Callable[..., dict[str, Any]]]] = {
     "ingest": cmd_ingest, "legacy": cmd_legacy, "leakage": cmd_leakage, "criteria": cmd_register_criteria,
+    "walkforward": partial(runs.cmd_walkforward, write_report=_write_report),
+    "leakage-wf": partial(runs.cmd_leakage_wf, write_report=_write_report),
+    "run": partial(runs.cmd_run, write_report=_write_report),
 }
 
 
 def _defaults(command: str, args: argparse.Namespace) -> dict[str, Any]:
     params: dict[str, Any] = {"root": str(Path(args.data_root).resolve()), "symbols": list(SYMBOLS)}
+    if command == "run":
+        params["workers"] = args.workers  # read and removed before registering: not a result parameter
     if command == "legacy":
         params["tolerance"] = 1e-12
     if command == "leakage":
@@ -330,9 +340,12 @@ def main(argv: list[str] | None = None) -> int:
     logging.getLogger("risk_router").setLevel(logging.ERROR)  # a replay logs every OPEN and EXIT; the store has them
     parser = argparse.ArgumentParser(prog="python -m backtest", description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("ingest", "legacy", "leakage"):
+    for name in ("ingest", "legacy", "leakage", "walkforward", "leakage-wf", "run"):
         p = sub.add_parser(name)
         p.add_argument("--allow-dirty", action="store_true", help="run on uncommitted code (cannot be cited)")
+        if name == "run":
+            p.add_argument("--workers", type=int, default=1,
+                           help="replay processes (default 1: one core; results do not depend on it)")
     crit = sub.add_parser("register-criteria")
     crit.add_argument("--order-notional", type=Decimal, required=True, help="the real-money order size, USD (D3)")
     crit.add_argument("--pass-rule", default=DEFAULT_PASS_RULE)

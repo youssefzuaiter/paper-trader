@@ -25,6 +25,7 @@ from __future__ import annotations
 import itertools
 import json
 import uuid
+from bisect import bisect_right
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
@@ -133,7 +134,8 @@ class SimAlpaca:
         self.cash = initial_cash
         self.last_equity = initial_cash
         self.positions: dict[str, SimPosition] = {}
-        self.orders: list[SimOrder] = []
+        self.orders: list[SimOrder] = []          # in submission order: time only moves forward
+        self._submitted: list[datetime] = []      # their submission times, for bisect
         self._working: list[SimOrder] = []
         self._by_client_id: dict[str, SimOrder] = {}
         self._ids = itertools.count(1)
@@ -225,7 +227,11 @@ class SimAlpaca:
         return out
 
     def orders_body(self, status: str, after: datetime | None, limit: int, direction: str) -> list[dict[str, Any]]:
-        chosen = [o for o in self.orders
+        if status == "open":
+            candidates = self._working
+        else:  # only orders submitted after ``after``: a bisect, not a scan of the whole history
+            candidates = self.orders[bisect_right(self._submitted, after):] if after is not None else self.orders
+        chosen = [o for o in candidates
                   if (status == "all" or (status == "open") == o.working)
                   and (after is None or o.submitted_at > after)]
         chosen.sort(key=lambda o: (o.submitted_at, o.id), reverse=direction == "desc")
@@ -298,6 +304,7 @@ class SimAlpaca:
             type=kind, time_in_force=tif, qty=qty, limit_price=limit, submitted_at=self.now, decided_at=self.now,
             eligible_from=eligible.timestamp(), session=session_index, next_bar=first)
         self.orders.append(order)
+        self._submitted.append(order.submitted_at)
         self._working.append(order)
         self._by_client_id[client_id] = order
         return 200, self._order_body(order)
