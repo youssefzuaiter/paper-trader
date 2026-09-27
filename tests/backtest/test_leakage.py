@@ -215,7 +215,7 @@ def stored_predictions(market: MarketData) -> list[dict]:
         at = day.open_at + timedelta(minutes=int(rng.integers(-600, 700)))
         events.append(Event(f"alpaca:{n}", str(n), "benzinga", at, None, at, f"news {n}", ("AAPL",), 1))
     samples, _ = build_v2(events, market, {e.headline: np.array([0.5, 0.3, 0.2]) for e in events})
-    return [{"prediction_id": f"p{i}", "symbol": str(samples.symbol[i]),
+    return [{"prediction_id": f"p{i}", "event_id": str(samples.event_id[i]), "symbol": str(samples.symbol[i]),
              "made_at": datetime.fromtimestamp(samples.made_at[i], ny(HOLIDAY, 0).tzinfo),
              "inputs": json.dumps(dict(zip(FEATURE_NAMES, map(float, samples.X[i]), strict=True)))}
             for i in range(len(samples))]
@@ -229,6 +229,15 @@ def test_l8_stored_inputs_equal_an_independent_recomputation(stored_predictions,
 def test_l8_twin_features_cut_off_a_session_late_are_caught(stored_predictions, market) -> None:
     check = leakage.feature_parity(stored_predictions, market, n=200, late=True)
     assert not check.passed and check.detail["mismatches"] > 150
+
+
+def test_l8_does_not_depend_on_prediction_ids(stored_predictions, market) -> None:
+    """A reproduction stores the same predictions under new, experiment-specific ids. L8's sample
+    and its reported examples must come out the same, or no leakage run could ever reproduce."""
+    renamed = [{**p, "prediction_id": f"other-experiment-{i}"} for i, p in enumerate(reversed(stored_predictions))]
+    for late in (False, True):
+        assert leakage.feature_parity(renamed, market, n=200, late=late).detail == \
+            leakage.feature_parity(stored_predictions, market, n=200, late=late).detail
 
 
 # --- L9 outcome isolation --------------------------------------------------------------------------------------

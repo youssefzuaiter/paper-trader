@@ -455,11 +455,14 @@ def feature_parity(predictions: Sequence[Mapping[str, Any]], market: MarketData,
                    late: bool = False) -> Check:
     """Stored inputs against ``daily_features(completed_sessions(bars, made_at))``
     recomputed independently. The twin stores features cut off one session late."""
+    # Sampled and reported by (event, symbol, time), never by prediction_id: prediction ids include
+    # the experiment, so an id-ordered sample would differ between a run and its reproduction.
+    ordered = sorted(predictions, key=lambda r: (str(r["event_id"]), str(r["symbol"]), r["made_at"]))
     rng = np.random.default_rng(seed)
-    pick = rng.choice(len(predictions), size=min(n, len(predictions)), replace=False)
+    pick = rng.choice(len(ordered), size=min(n, len(ordered)), replace=False)
     bad = []
     for k in pick:
-        p = predictions[int(k)]
+        p = ordered[int(k)]
         inputs = json.loads(p["inputs"]) if isinstance(p["inputs"], str) else p["inputs"]
         bars = market.daily[p["symbol"]]
         expected = daily_features(completed_sessions(bars, p["made_at"]))
@@ -468,7 +471,7 @@ def feature_parity(predictions: Sequence[Mapping[str, Any]], market: MarketData,
             cut = datetime.combine(upcoming.date, SESSION_PUBLISHED_AT, NEW_YORK)
             inputs = daily_features(completed_sessions(bars, cut))
         if any(inputs[name] != expected[name] for name in DAILY_FEATURES):
-            bad.append(p["prediction_id"])
+            bad.append(f"{p['event_id']}|{p['symbol']}|{p['made_at'].isoformat()}")
     return Check("L8", not bad, {"checked": len(pick), "mismatches": len(bad), "examples": bad[:5], "late": late})
 
 
