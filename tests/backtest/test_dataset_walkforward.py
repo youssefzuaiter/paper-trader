@@ -197,3 +197,8 @@ def test_serving_and_stored_predictions(long_calendar: Calendar) -> None:
     first = rows[0]
     assert first["inputs"]["rsi14"] == samples.X[fold.scored[0], FEATURE_NAMES.index("rsi14")]
     assert first["model_version"] == fold.model_version and first["horizon"] == "close"
+    # Ids are stable within an experiment and distinct across experiments (clean re-runs, reproductions).
+    assert [r["prediction_id"] for r in prediction_rows(samples, [fold], experiment_id="x1")] == \
+        [r["prediction_id"] for r in rows]
+    assert not {r["prediction_id"] for r in prediction_rows(samples, [fold], experiment_id="x2")} & \
+        {r["prediction_id"] for r in rows}

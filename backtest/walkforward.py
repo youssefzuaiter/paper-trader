@@ -364,7 +364,9 @@ def prediction_rows(samples: Samples, folds: list[FoldResult], *, experiment_id:
             prob = float(f.prob_scored[k])
             expected = serving["S2" if samples.night[i] else "S3"].expected_move(prob)
             made_at = datetime.fromtimestamp(float(samples.made_at[i]), NEW_YORK)
-            key = f"{samples.event_id[i]}|{samples.symbol[i]}|{f.model_version}|{made_at.isoformat()}"
+            # The experiment is part of the id: the same prediction recomputed by another experiment
+            # (a clean re-run, a reproduction) is that experiment's own row, never a clash.
+            key = f"{experiment_id}|{samples.event_id[i]}|{samples.symbol[i]}|{f.model_version}|{made_at.isoformat()}"
             rows.append({
                 "prediction_id": hashlib.sha256(key.encode()).hexdigest()[:32],
                 "event_id": str(samples.event_id[i]), "symbol": str(samples.symbol[i]),

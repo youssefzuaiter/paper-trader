@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -207,3 +208,49 @@ def test_models_and_runs(store: Store) -> None:
     store.set_run_metrics("r1", {"sharpe": 0.1})
     assert store.models()[0]["fold_month"] == date(2025, 1, 1)
     assert store.runs("x1")[0]["metrics"] == canonical_json({"sharpe": 0.1})
+
+
+def _model(experiment_id: str, **overrides: object) -> dict:
+    return {
+        "model_version": "wf-2025-01-abc", "experiment_id": experiment_id, "fold_month": date(2025, 1, 1),
+        "fold_start": T0, "embargo_cutoff": T0, "feature_names": ["a"], "windows": {}, "label": {},
+        "params": {"max_iter": 300}, "seed": 7, "git_commit": "abc", "data_hash": "d", "artifact_sha256": "s",
+        "thresholds": {"S2": 0.46}, "move_tables": {}, **overrides,
+    }
+
+
+def test_the_same_fold_can_belong_to_several_experiments(store: Store) -> None:
+    """A clean re-run or a reproduction fits the same content-addressed model_version under a new
+    experiment (and commit). That is its own row, not a clash."""
+    store.put_models([_model("x-dirty")])
+    store.put_models([_model("x-clean", git_commit="def", artifact_sha256="s2")])
+    assert [m["experiment_id"] for m in store.models(experiment_id="x-clean")] == ["x-clean"]
+    assert len(store.models()) == 2
+    with pytest.raises(StoreConflict):  # within one experiment a key still means one content
+        store.put_models([_model("x-clean", thresholds={"S2": 0.5})])
+
+
+def test_a_store_keyed_the_old_way_is_migrated_with_its_rows(tmp_path: Path) -> None:
+    path = tmp_path / "old.duckdb"
+    with Store(path) as s:  # rebuild the model table as it was before 2026-09-27
+        s.put_models([_model("x1")])
+        con = s._con
+        con.execute("CREATE TABLE model_old AS SELECT * FROM model")
+        con.execute("DROP TABLE model")
+        ddl = SCHEMA_PATH.read_text(encoding="utf-8")
+        old = re.search(r"CREATE TABLE IF NOT EXISTS model \(.*?\n\);", ddl, flags=re.DOTALL).group(0)
+        old = old.replace("model_version    VARCHAR NOT NULL,", "model_version    VARCHAR PRIMARY KEY,")
+        old = old.replace(",\n    PRIMARY KEY (model_version, experiment_id)", "")
+        con.execute(old)
+        con.execute("INSERT INTO model SELECT * FROM model_old")
+        con.execute("DROP TABLE model_old")
+        key = con.execute("SELECT constraint_column_names FROM duckdb_constraints() "
+                          "WHERE table_name = 'model' AND constraint_type = 'PRIMARY KEY'").fetchone()[0]
+        assert tuple(key) == ("model_version",)
+    with Store(path) as s:
+        key = s._con.execute("SELECT constraint_column_names FROM duckdb_constraints() "
+                             "WHERE table_name = 'model' AND constraint_type = 'PRIMARY KEY'").fetchone()[0]
+        assert tuple(key) == ("model_version", "experiment_id")
+        assert [m["experiment_id"] for m in s.models()] == ["x1"]
+        s.put_models([_model("x2")])  # the collision that blocked clean re-runs
+        assert len(s.models()) == 2

@@ -33,8 +33,10 @@ CREATE TABLE IF NOT EXISTS event_symbol (
 );
 
 CREATE TABLE IF NOT EXISTS model (
-    model_version    VARCHAR PRIMARY KEY,
-    experiment_id    VARCHAR,
+    -- One row per (fitted model, experiment): model_version is content-addressed, so the same fold
+    -- fitted by a later run or a reproduction gets its own row under its own experiment.
+    model_version    VARCHAR NOT NULL,
+    experiment_id    VARCHAR NOT NULL,
     fold_month       DATE,
     fold_start       TIMESTAMPTZ,
     embargo_cutoff   TIMESTAMPTZ,
@@ -47,11 +49,12 @@ CREATE TABLE IF NOT EXISTS model (
     data_hash        VARCHAR NOT NULL,
     artifact_sha256  VARCHAR NOT NULL,
     thresholds       JSON NOT NULL,
-    move_tables      JSON NOT NULL
+    move_tables      JSON NOT NULL,
+    PRIMARY KEY (model_version, experiment_id)
 );
 
 CREATE TABLE IF NOT EXISTS prediction (
-    prediction_id      VARCHAR PRIMARY KEY,  -- hash(event, symbol, model, made_at)
+    prediction_id      VARCHAR PRIMARY KEY,  -- hash(experiment, event, symbol, model, made_at)
     event_id           VARCHAR NOT NULL,
     symbol             VARCHAR NOT NULL,
     model_version      VARCHAR NOT NULL,

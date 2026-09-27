@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import UTC, date, datetime
 from decimal import Decimal
@@ -36,7 +37,7 @@ SCHEMA_PATH: Final[Path] = Path(__file__).with_name("schema.sql")
 KEYS: Final[dict[str, tuple[str, ...]]] = {
     "event": ("event_id",),
     "event_symbol": ("event_id", "symbol"),
-    "model": ("model_version",),
+    "model": ("model_version", "experiment_id"),
     "prediction": ("prediction_id",),
     "outcome": ("prediction_id", "horizon"),
     "trade_event": ("run_id", "trade_id", "seq"),
@@ -78,12 +79,37 @@ class Store:
         self._con = duckdb.connect(self.path)
         self._con.execute("SET TimeZone = 'UTC'")
         self._con.execute(SCHEMA_PATH.read_text(encoding="utf-8"))
+        self._migrate_model_key()
         self._types = {
             table: dict(self._con.execute(
                 "SELECT column_name, data_type FROM information_schema.columns "
                 "WHERE table_name = ? ORDER BY ordinal_position", [table]).fetchall())
             for table in KEYS
         }
+
+    def _migrate_model_key(self) -> None:
+        """Stores created before 2026-09-27 keyed ``model`` on ``model_version`` alone, so a second
+        walk-forward (a clean re-run, or ``reproduce``) collided with the first. Rebuild the table
+        with the (model_version, experiment_id) key, keeping every row. A no-op once migrated."""
+        key = self._con.execute(
+            "SELECT constraint_column_names FROM duckdb_constraints() "
+            "WHERE table_name = 'model' AND constraint_type = 'PRIMARY KEY'").fetchone()
+        if key is None or tuple(key[0]) == KEYS["model"]:
+            return
+        ddl = re.search(r"CREATE TABLE IF NOT EXISTS model \(.*?\n\);",
+                        SCHEMA_PATH.read_text(encoding="utf-8"), flags=re.DOTALL)
+        if ddl is None:
+            raise RuntimeError("schema.sql has no model table")
+        self._con.execute("BEGIN TRANSACTION")
+        try:
+            self._con.execute("ALTER TABLE model RENAME TO model_pre_migration")
+            self._con.execute(ddl.group(0))
+            self._con.execute("INSERT INTO model SELECT * FROM model_pre_migration")
+            self._con.execute("DROP TABLE model_pre_migration")
+            self._con.execute("COMMIT")
+        except Exception:
+            self._con.execute("ROLLBACK")
+            raise
 
     def close(self) -> None:
         self._con.close()
