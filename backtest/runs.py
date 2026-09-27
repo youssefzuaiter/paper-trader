@@ -63,11 +63,28 @@ def fit(samples: Samples, market: MarketData, sizes: list[Decimal], schedule: Sc
     return out
 
 
-def _criteria(store: Store) -> tuple[str, dict[str, Any]]:
+def _criteria(store: Store, pinned: str | None = None) -> tuple[str, dict[str, Any]]:
+    """The criteria an experiment runs under: ``pinned`` when its params already name one (a
+    reproduction re-runs the original's params), else the latest registered."""
+    if pinned is not None:
+        return pinned, json.loads(store.experiment(pinned)["params"])
     done = [r for r in store.experiments(command="criteria") if r["status"] == "done"]
     if not done:
         raise PermissionError("no registered order size and pass criteria: run `python -m backtest register-criteria`")
     return done[-1]["experiment_id"], json.loads(done[-1]["params"])
+
+
+def cited_walkforward(store: Store, pinned: str | None = None) -> dict[str, Any]:
+    """The walk-forward a strategy run cites: ``pinned`` when its params already name one (so a
+    reproduction cites exactly what the original cited), else the latest done, unsuperseded
+    walk-forward that is not itself a reproduction."""
+    if pinned is not None:
+        return store.experiment(pinned)
+    walkforwards = [r for r in store.experiments(command="walkforward") if r["status"] == "done"
+                    and r["superseded_by"] is None and r["parent_id"] is None]
+    if not walkforwards:
+        raise PermissionError("run the walk-forward first")
+    return walkforwards[-1]
 
 
 def _sizes(criteria: dict[str, Any]) -> list[Decimal]:
@@ -80,7 +97,7 @@ def _sizes(criteria: dict[str, Any]) -> list[Decimal]:
 def cmd_walkforward(params: dict[str, Any], store: Store, *, allow_dirty: bool, parent_id: str | None,
                     write_report: Any) -> dict[str, Any]:
     root, symbols = Path(params["root"]), tuple(params["symbols"])
-    criteria_id, criteria = _criteria(store)
+    criteria_id, criteria = _criteria(store, params.get("criteria_experiment"))
     params = {**params, "criteria_experiment": criteria_id, "sizes_usd": [str(s) for s in _sizes(criteria)],
               "schedule": Schedule().as_params(), "dataset": DatasetConfig().as_params(),
               "threshold_rule": {"grid": list(THRESHOLD_GRID), "min_symbol_days": walkforward.MIN_SYMBOL_DAYS,
@@ -184,7 +201,7 @@ def cmd_leakage_wf(params: dict[str, Any], store: Store, *, allow_dirty: bool, p
     from dataclasses import replace
 
     root, symbols = Path(params["root"]), tuple(params["symbols"])
-    criteria_id, criteria = _criteria(store)
+    criteria_id, criteria = _criteria(store, params.get("criteria_experiment"))
     size = _sizes(criteria)[-1]
     params = {**params, "criteria_experiment": criteria_id, "size_usd": str(size), "schedule": Schedule().as_params(),
               "l2_seeds": 10, "l2_bootstrap": 1000, "l2_placebo_seeds": 100, "l8_n": 1000, "seed": 0}
@@ -275,12 +292,8 @@ PASS_RULE_EVALUATION = {
 def cmd_run(params: dict[str, Any], store: Store, *, allow_dirty: bool, parent_id: str | None,
             write_report: Any) -> dict[str, Any]:
     root, symbols = Path(params["root"]), tuple(params["symbols"])
-    criteria_id, criteria = _criteria(store)
-    walkforwards = [r for r in store.experiments(command="walkforward") if r["status"] == "done"
-                    and r["superseded_by"] is None]
-    if not walkforwards:
-        raise PermissionError("run the walk-forward first")
-    wf = walkforwards[-1]
+    criteria_id, criteria = _criteria(store, params.get("criteria_experiment"))
+    wf = cited_walkforward(store, params.get("walkforward_experiment"))
     plan = pipeline.Plan(sizes=tuple(_sizes(criteria)), workers=int(params.pop("workers", 1)))
     params = {**params, "criteria_experiment": criteria_id, "walkforward_experiment": wf["experiment_id"],
               "plan": plan.as_params(), "strategies": ["S0", "S1", "S2", "S2_collapsed", "S3", "S3_collapsed",

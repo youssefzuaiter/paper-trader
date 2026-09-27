@@ -103,7 +103,31 @@ def test_configuration_n_of_m_counts_the_same_command_on_the_same_window(tmp_pat
                 ids.append(exp.experiment_id)
         with begin(store, repo, window=(date(2024, 1, 1), date(2024, 12, 1))) as other:
             other.finish({}, report_body=None, conclusion="c")
-        assert [registry.configuration(store, i) for i in ids] == [(1, 3), (2, 3), (3, 3)]
+        # Counted as of each run, so a report's "N of M" never changes after it is written.
+        assert [registry.configuration(store, i) for i in ids] == [(1, 1), (2, 2), (3, 3)]
+        # A reproduction is not a configuration: it reports its parent's count and adds none.
+        with begin(store, repo, window=window, parent_id=ids[1]) as rerun:
+            rerun.finish({}, report_body=None, conclusion="c")
+        assert registry.configuration(store, rerun.experiment_id) == (2, 2)
+        with begin(store, repo, window=window) as later:
+            later.finish({}, report_body=None, conclusion="c")
+        assert registry.configuration(store, later.experiment_id) == (4, 4)
+        assert registry.configuration(store, ids[2]) == (3, 3)
+
+
+def test_a_strategy_run_cites_the_walkforward_its_params_name(tmp_path: Path) -> None:
+    """A reproduction re-runs the original's params, so it must cite the same walk-forward, not
+    whichever is newest (the walk-forward's own reproduction, for instance)."""
+    from backtest.runs import cited_walkforward
+
+    repo = fresh_repo(tmp_path / "r")
+    with Store() as store:
+        with begin(store, repo, command="walkforward") as first:
+            first.finish({}, report_body=None, conclusion="c")
+        with begin(store, repo, command="walkforward", parent_id=first.experiment_id) as reproduction:
+            reproduction.finish({}, report_body=None, conclusion="c")
+        assert cited_walkforward(store)["experiment_id"] == first.experiment_id  # reproductions are skipped
+        assert cited_walkforward(store, first.experiment_id)["experiment_id"] == first.experiment_id
 
 
 def test_the_lockbox_opens_only_inside_a_registered_lockbox_experiment(tmp_path: Path) -> None:

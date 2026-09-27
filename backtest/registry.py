@@ -193,11 +193,15 @@ def open_lockbox(store: Store, experiment: Experiment) -> LockBoxKey:
 
 
 def configuration(store: Store, experiment_id: str) -> tuple[int, int]:
-    """``(N, M)``: this is configuration N of the M experiments run with the same command on the same window."""
+    """``(N, M)``: configuration N of the M experiments run with the same command on the same window,
+    counted as of the original run. Reproductions are not configurations: one reports its parent's
+    count, and none is counted, so neither a reproduction nor a later run changes an earlier report."""
     row = store.experiment(experiment_id)
-    same = [r for r in store.experiments(command=row["command"])
-            if (r["window_start"], r["window_end"]) == (row["window_start"], row["window_end"])]
-    return [r["experiment_id"] for r in same].index(experiment_id) + 1, len(same)
+    anchor = store.experiment(row["parent_id"]) if row["parent_id"] else row
+    same = [r for r in store.experiments(command=anchor["command"])
+            if (r["window_start"], r["window_end"]) == (anchor["window_start"], anchor["window_end"])
+            and r["parent_id"] is None and r["created_at"] <= anchor["created_at"]]
+    return [r["experiment_id"] for r in same].index(anchor["experiment_id"]) + 1, len(same)
 
 
 # --- reproduction ----------------------------------------------------------------------------------
