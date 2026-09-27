@@ -72,11 +72,25 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def _input_label(path: Path, root: Path) -> str:
+    """``path`` relative to the data ``root``, or else to the code tree (``ROOT``).
+
+    A reproduction runs committed code from a temporary worktree against the original data root,
+    so an input that ships with the code (``backtest/fees.json``) lives outside the data root.
+    Labelling it against the code tree gives it the same path it had in the original run, where
+    code and data shared one repository.
+    """
+    for base in (root.resolve(), ROOT):
+        if path.is_relative_to(base):
+            return str(path.relative_to(base))
+    raise ValueError(f"{path} is in neither the data root {root} nor the code tree {ROOT}")
+
+
 def manifest(paths: Sequence[Path], root: Path) -> dict[str, Any]:
     """Every input file relative to ``root`` (size, sha256) and one hash over all of them."""
     files = []
     for path in sorted({p.resolve() for p in paths}):
-        files.append({"path": str(path.relative_to(root.resolve())), "size": path.stat().st_size,
+        files.append({"path": _input_label(path, root), "size": path.stat().st_size,
                       "sha256": sha256_file(path)})
     combined = hashlib.sha256("\n".join(f"{f['path']}:{f['size']}:{f['sha256']}" for f in files).encode())
     return {"root": str(root.resolve()), "files": files, "hash": combined.hexdigest()}

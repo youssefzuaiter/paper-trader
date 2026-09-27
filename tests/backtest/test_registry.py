@@ -181,3 +181,17 @@ def test_an_experiment_run_on_a_dirty_tree_cannot_be_reproduced(tmp_path: Path) 
         exp.finish({}, report_body="b", conclusion="c")
     with pytest.raises(registry.DirtyTree):
         registry.reproduce(store_path, exp.experiment_id, repo=repo)
+
+
+def test_a_code_file_keeps_its_path_when_data_lives_elsewhere(tmp_path: Path) -> None:
+    """``reproduce`` runs worktree code against the original data root. ``fees.json`` ships with the
+    code, so it sits outside that root; it must still be recorded as ``backtest/fees.json``."""
+    from backtest.registry import ROOT, manifest
+
+    data = tmp_path / "data.txt"
+    data.write_text("x", encoding="utf-8")
+    fees = ROOT / "backtest" / "fees.json"
+    recorded = manifest([data, fees], tmp_path)
+    assert [f["path"] for f in recorded["files"]] == sorted(["data.txt", "backtest/fees.json"])
+    with pytest.raises(ValueError):
+        manifest([Path("/etc/hosts")], tmp_path)
