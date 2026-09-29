@@ -8,3 +8,6 @@ pytest-asyncio>=0.24
 redis>=5.0
 fakeredis>=2.26
 scikit-learn==1.9.1
+# The backtester's point-in-time store and Parquet cache (backtest/, design D10).
+# Research only: no service image imports it.
+duckdb>=1.1

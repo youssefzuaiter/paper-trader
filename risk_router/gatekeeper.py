@@ -113,11 +113,19 @@ class RiskRouter:
         *,
         on_submitted: OnSubmitted | None = None,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
+        min_prob_up: Decimal = tier0.ROUTER_MIN_PROB_UP,
     ) -> None:
+        """``min_prob_up`` exists for the backtester alone, which must test
+        thresholds below the live one. Production wiring never passes it
+        (``tests/test_risk_router.py`` holds that), and every other limit
+        stays a hardcoded ``tier0`` constant."""
+        if not Decimal(0) <= min_prob_up <= Decimal(1):
+            raise ValueError(f"min_prob_up must be a probability, got {min_prob_up}")
         self.alpaca = alpaca
         self.guard = guard
         self._on_submitted = on_submitted
         self._now = now
+        self._min_prob_up = min_prob_up
         self._lock = asyncio.Lock()
 
     def _decision(self, decision: str, code: str, detail: str, symbol: str, intent: Intent, **extra: Any) -> Decision:
@@ -195,13 +203,16 @@ class RiskRouter:
         return self._decision("accepted", "submitted", f"limit buy {plan.quantity} @ {plan.limit_price}",
                               symbol, Intent.OPEN, order=_order_summary(order), plan=plan.as_dict())
 
-    @staticmethod
-    def _entry_gate(signal: TradeSignal, now: datetime) -> tuple[str, str] | None:
+    @property
+    def min_prob_up(self) -> Decimal:
+        return self._min_prob_up
+
+    def _entry_gate(self, signal: TradeSignal, now: datetime) -> tuple[str, str] | None:
         if now - signal.created_at > MAX_SIGNAL_AGE:
             return "stale_signal", f"signal created at {signal.created_at.isoformat()}"
         prob_up = Decimal(str(signal.prob_up))
-        if prob_up < tier0.ROUTER_MIN_PROB_UP:
-            return "below_min_prob", f"prob_up {prob_up} is below {tier0.ROUTER_MIN_PROB_UP}"
+        if prob_up < self._min_prob_up:
+            return "below_min_prob", f"prob_up {prob_up} is below {self._min_prob_up}"
         if signal.predicted_move_pct <= 0:
             return "non_positive_edge", f"predicted move {signal.predicted_move_pct}% is not positive"
         return None
