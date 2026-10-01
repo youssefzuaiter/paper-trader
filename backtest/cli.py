@@ -8,6 +8,10 @@ registers an experiment before computing anything (design §8).
     walkforward         the monthly walk-forward: models, predictions, outcomes, thresholds per size
     leakage-wf          L1, L2, L5, L6 and L8 on the real walk-forward, each beside its twin
     run                 S0-S3 and B1-B3 at three cost levels and both sizes; the registered pass rule
+    ingest-core         the long-term core's data: daily bars, BTC/USD 5-minute bars, the quote sample
+    register-core       the core's whole grid, reading rules and the owner's tolerance, before any core result
+    leakage-core        checks C1-C12 for the core, each beside a broken twin that must fail
+    run-core ID         every registered core configuration and the report (ID: the registration)
     experiments         the registry, newest last
     reproduce ID        re-run an experiment from its commit; identical metrics and report hash or fail
 
@@ -33,8 +37,8 @@ from typing import Any, Final
 
 import numpy as np
 
+from backtest import core_runs, leakage, registry, runs
 from backtest import events as ev
-from backtest import leakage, registry, runs
 from backtest import report as reports
 from backtest.calendar import Calendar
 from backtest.data import (
@@ -316,6 +320,10 @@ COMMANDS: Final[dict[str, Callable[..., dict[str, Any]]]] = {
     "walkforward": partial(runs.cmd_walkforward, write_report=_write_report),
     "leakage-wf": partial(runs.cmd_leakage_wf, write_report=_write_report),
     "run": partial(runs.cmd_run, write_report=_write_report),
+    "ingest-core": partial(core_runs.cmd_ingest_core, write_report=_write_report),
+    core_runs.REGISTRATION: partial(core_runs.cmd_register_core, write_report=_write_report),
+    core_runs.LEAKAGE: partial(core_runs.cmd_leakage_core, write_report=_write_report),
+    core_runs.RUN: partial(core_runs.cmd_run_core, write_report=_write_report),
 }
 
 
@@ -331,6 +339,15 @@ def _defaults(command: str, args: argparse.Namespace) -> dict[str, Any]:
     if command == "criteria":
         params.update({"order_notional_usd": str(args.order_notional), "pass_rule": args.pass_rule,
                        "lockbox_criteria": args.lockbox_criteria})
+    if command in ("ingest-core", core_runs.REGISTRATION, core_runs.LEAKAGE, core_runs.RUN):
+        params = {"root": params["root"]}
+    if command == core_runs.REGISTRATION:
+        from backtest.core_grid import registration_params
+        params.update({"registration": registration_params(), "supersedes": args.supersedes})
+    if command == core_runs.LEAKAGE:
+        params.update(core_runs.leakage_defaults())
+    if command == core_runs.RUN:
+        params["registration"] = args.registration
     return params
 
 
@@ -351,6 +368,14 @@ def main(argv: list[str] | None = None) -> int:
     crit.add_argument("--pass-rule", default=DEFAULT_PASS_RULE)
     crit.add_argument("--lockbox-criteria", required=True, help="what the lock-box must show to confirm (D5, D8)")
     crit.add_argument("--allow-dirty", action="store_true")
+    for name in ("ingest-core", "leakage-core"):
+        sub.add_parser(name).add_argument("--allow-dirty", action="store_true")
+    reg = sub.add_parser("register-core")
+    reg.add_argument("--supersedes", default=None, help="the registration this one replaces (it still counts)")
+    reg.add_argument("--allow-dirty", action="store_true")
+    run_core = sub.add_parser("run-core")
+    run_core.add_argument("registration", help="the core-registration experiment id")
+    run_core.add_argument("--allow-dirty", action="store_true")
     sub.add_parser("experiments")
     rep = sub.add_parser("reproduce")
     rep.add_argument("experiment_id")
@@ -379,7 +404,8 @@ def main(argv: list[str] | None = None) -> int:
             result = COMMANDS[original["command"]](json.loads(original["params"]), store, allow_dirty=False,
                                                    parent_id=args.experiment_id)
         else:
-            command = "criteria" if args.command == "register-criteria" else args.command
+            command = {"register-criteria": "criteria", "register-core": core_runs.REGISTRATION}.get(
+                args.command, args.command)
             result = COMMANDS[command](_defaults(command, args), store, allow_dirty=args.allow_dirty, parent_id=None)
     print(json.dumps(result, indent=1, default=str))
     return 0

@@ -43,6 +43,7 @@ KEYS: Final[dict[str, tuple[str, ...]]] = {
     "trade_event": ("run_id", "trade_id", "seq"),
     "experiment": ("experiment_id",),
     "run": ("run_id",),
+    "core_day": ("run_id", "day"),
 }
 
 
@@ -172,6 +173,15 @@ class Store:
 
     def put_run(self, row: Mapping[str, Any]) -> None:
         self._insert("run", [row])
+
+    def put_runs(self, rows: Sequence[Mapping[str, Any]]) -> int:
+        return sum(self._insert("run", batch) for batch in chunks(rows, 50_000))
+
+    def put_core_days(self, rows: Sequence[Mapping[str, Any]]) -> int:
+        return sum(self._insert("core_day", batch) for batch in chunks(rows, 50_000))
+
+    def core_days(self, run_id: str) -> list[dict[str, Any]]:
+        return self._rows("SELECT * FROM core_day WHERE run_id = ? ORDER BY day", [run_id])
 
     def set_run_metrics(self, run_id: str, metrics: Mapping[str, Any]) -> None:
         self._con.execute("UPDATE run SET metrics = ? WHERE run_id = ? AND metrics IS NULL",

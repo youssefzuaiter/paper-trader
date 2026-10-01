@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
 from collections.abc import Mapping, Sequence
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Final, Protocol
 
@@ -86,8 +86,9 @@ class DailyMarket:
                     out.setdefault(row["symbol"], {})[row["t"].astimezone(NEW_YORK).date()] = (row["o"], row["c"])
         crypto = frozenset({BTC} & wanted)
         if crypto:
-            cols = parquet.read_numpy(paths.btc_5min, "t, o, c", "ORDER BY t")
-            adjusted[BTC] = btc_samples(sessions, list(cols["t"]), list(cols["o"]), list(cols["c"]))
+            cols = parquet.read_numpy(paths.btc_5min, "epoch(t)::BIGINT AS t, o, c", "ORDER BY t")
+            starts = [datetime.fromtimestamp(int(e), UTC) for e in cols["t"]]
+            adjusted[BTC] = btc_samples(sessions, starts, [float(x) for x in cols["o"]], [float(x) for x in cols["c"]])
         missing = wanted - set(adjusted)
         if missing:
             raise ValueError(f"no bars for {sorted(missing)}")
@@ -178,7 +179,7 @@ def btc_samples(sessions: Sequence[Session], t: Sequence[datetime], o: Sequence[
     out: dict[date, tuple[float, float]] = {}
     if not t:
         return out
-    starts = [x if x.tzinfo else x.replace(tzinfo=sessions[0].open_at.tzinfo) for x in t]
+    starts = list(t)
     for s in sessions:
         if s.close_at < starts[0] + BAR or s.open_at > starts[-1]:
             continue

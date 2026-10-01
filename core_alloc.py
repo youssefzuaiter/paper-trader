@@ -167,9 +167,11 @@ class Plan:
 
 
 def plan_rebalance(decided_on: date, qty: Mapping[str, Decimal], prices: Mapping[str, Decimal], cash: Decimal,
-                   targets: Mapping[str, Decimal], *, min_order_usd: Decimal, reason: str = "rebalance") -> Plan:
+                   targets: Mapping[str, Decimal], *, min_order_usd: Decimal, reason: str = "rebalance",
+                   cents: bool = True) -> Plan:
     """Fully back to ``targets`` at the decision close's ``prices``. An order below
-    ``min_order_usd`` is skipped and its drift stays (Alpaca's fractional minimum)."""
+    ``min_order_usd`` is skipped and its drift stays (Alpaca's fractional minimum). Buy notionals
+    are whole cents unless ``cents`` is False (the frictionless consistency level only)."""
     value = cash + sum((q * prices[s] for s, q in qty.items()), Decimal(0))
     if value <= 0:
         raise ValueError("portfolio value is not positive")
@@ -188,18 +190,19 @@ def plan_rebalance(decided_on: date, qty: Mapping[str, Decimal], prices: Mapping
             if sell > 0:
                 sells[symbol] = sell
         else:
-            buys[symbol] = delta.quantize(CENT, ROUND_DOWN)
+            buys[symbol] = delta.quantize(CENT, ROUND_DOWN) if cents else delta
     return Plan(decided_on, dict(targets), sells, buys, reason)
 
 
-def scale_buys(buys: Mapping[str, Decimal], available: Decimal, cost_rate: Mapping[str, Decimal]) -> dict[str, Decimal]:
+def scale_buys(buys: Mapping[str, Decimal], available: Decimal, cost_rate: Mapping[str, Decimal], *,
+               cents: bool = True) -> dict[str, Decimal]:
     """Each buy's notional scaled pro-rata so notional·(1 + cost) fits in ``available`` cash
     (design §3.1 c: buys capped by cash, never an overdraft)."""
     need = sum((n * (ONE + cost_rate.get(s, Decimal(0))) for s, n in buys.items()), Decimal(0))
     if need <= available or need == 0:
         return dict(buys)
     k = max(available, Decimal(0)) / need
-    return {s: (n * k).quantize(CENT, ROUND_DOWN) for s, n in buys.items()}
+    return {s: (n * k).quantize(CENT, ROUND_DOWN) if cents else n * k for s, n in buys.items()}
 
 
 # --- tax lots (design §3.5) ------------------------------------------------------------------------------
@@ -364,3 +367,26 @@ def _water_fill(excess: Mapping[str, Decimal], remaining: Decimal, cost_rate: Ma
         for s in group:
             raised += take(s, step)
     return raised
+
+
+def plan_raise_cash_pro_rata(decided_on: date, qty: Mapping[str, Decimal], prices: Mapping[str, Decimal],
+                             cash_free: Decimal, need: Decimal, targets: Mapping[str, Decimal], *,
+                             cost_rate: Mapping[str, Decimal], min_order_usd: Decimal = Decimal(1)) -> Plan:
+    """The §6.3 baseline: free cash first, then every holding sold in proportion to its value."""
+    values = {s: q * prices[s] for s, q in qty.items() if q > 0}
+    total = sum(values.values(), Decimal(0))
+    liquidation = cash_free + sum((v * (ONE - cost_rate.get(s, Decimal(0))) for s, v in values.items()), Decimal(0))
+    if need > liquidation:
+        raise ValueError(f"exceeds_portfolio: need {need}, liquidation value {liquidation}")
+    remaining = need - min(max(cash_free, Decimal(0)), need)
+    sells: dict[str, Decimal] = {}
+    if remaining > DONE and total > 0:
+        net_per_dollar = sum((v / total * (ONE - cost_rate.get(s, Decimal(0))) for s, v in values.items()), Decimal(0))
+        gross = remaining / net_per_dollar
+        for s, v in sorted(values.items()):
+            usd = gross * v / total
+            if usd < CENT:
+                continue
+            usd = max(usd, min(min_order_usd, v))
+            sells[s] = min((usd / prices[s]).quantize(QTY_QUANTUM, ROUND_UP_QTY), qty[s])
+    return Plan(decided_on, dict(targets), sells, {}, "raise_cash")

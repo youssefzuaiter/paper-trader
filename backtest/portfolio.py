@@ -77,6 +77,7 @@ class Spec:
     cash_needs: tuple[tuple[date, Decimal], ...] = ()
     needs_view: bool = False     # M4: weights read trailing volatility through the view
     buffer_symbol: str | None = None  # the cash-buffer sleeve a raise-cash plan drains first
+    raise_method: str = "plan"   # "plan" (design §6.1) or "pro_rata" (the §6.3 baseline)
 
 
 @dataclass
@@ -96,7 +97,10 @@ class Day:
     rebalanced: bool = False
     deferred: bool = False       # a plan with buys was blocked by the breaker
     decided: str | None = None   # what this close decided: "rebalance", "raise_cash", ...
+    unrealised: Decimal | None = None  # last day only: value of holdings minus their cost basis
+    tax_base_pending: Decimal | None = None  # last day only: this year's realised net, less losses carried
     orders: list[dict[str, str]] = field(default_factory=list)
+    positions: dict[str, Decimal] = field(default_factory=dict)  # units held at the close
 
     @property
     def costs(self) -> Decimal:
@@ -148,7 +152,7 @@ def simulate(prices: Prices, spec: Spec, start: int, end: int, level: CostLevel,
                 forced = True
                 carried, carried_tax = pending.need, pending.tax
             elif profile.sizing == "phase1":
-                cash = _fill_phase1(prices, spec, k, level, fees, pending, qty, cash, day)
+                cash = _fill_phase1(prices, spec, k, level, fees, rounding, pending, qty, cash, day)
             else:
                 cash, carried = _fill_core(prices, spec, k, level, fees, rounding, pending, qty, holdings, tax, cash,
                                            day, daily_fees)
@@ -162,11 +166,15 @@ def simulate(prices: Prices, spec: Spec, start: int, end: int, level: CostLevel,
         closes = {s: prices.close(s, k) for s, q in qty.items() if q}
         value = cash + sum((q * closes[s] for s, q in qty.items() if q), ZERO)
         day.value, day.cash = value, cash
+        day.positions = {s: q for s, q in qty.items() if q}
         day.weights = core_alloc.current_weights(qty, closes, cash) if value > 0 else {}
         out.append(day)
         prev_value = value
         # --- 3. decision, as of close + 15 minutes ----------------------------------------------------------
         if k == end:
+            day.unrealised = sum((q * closes[s] - holdings[s].cost for s, q in qty.items() if q), ZERO) \
+                if profile.sizing == "core" else None
+            day.tax_base_pending = tax.realised.get(day_date.year, ZERO) - tax.carried_loss
             break
         ends = core_alloc.period_ends(day_date, prices.sessions[k + 1].date)
         tax_due = tax.due(day_date.year) if "year" in ends and spec.tax_rate > 0 else ZERO
@@ -185,7 +193,7 @@ def simulate(prices: Prices, spec: Spec, start: int, end: int, level: CostLevel,
             targets = spec.weights(view)
             prices_k = {s: prices.close(s, k) for s in set(qty) | set(targets)}
             plan = core_alloc.plan_rebalance(day_date, qty, prices_k, cash - need - spec.cash_reserve_usd, targets,
-                                             min_order_usd=spec.min_order_usd)
+                                             min_order_usd=spec.min_order_usd, cents=level.round_prices)
             if profile.sizing == "phase1" or not plan.empty or need > 0:
                 pending = _Pending(plan, value, need=need, tax=carried_tax)
                 day.decided = "rebalance"
@@ -193,10 +201,16 @@ def simulate(prices: Prices, spec: Spec, start: int, end: int, level: CostLevel,
             prices_k = {s: prices.close(s, k) for s in qty if qty[s]}
             # Each sale may round up to a cent per fee type (pessimistic level): allow for it in the need.
             allowance = SELL_ROUNDING_USD * len(prices_k) if level.fee_rounding != "none" else ZERO
-            plan = core_alloc.plan_raise_cash(day_date, {s: q for s, q in qty.items() if q}, prices_k,
-                                              cash - spec.cash_reserve_usd, need + allowance, targets,
-                                              cost_rate={s: _cost_rate(level, s, prices, "sell") for s in prices_k},
-                                              buffer_symbol=spec.buffer_symbol, min_order_usd=spec.min_order_usd)
+            held = {s: q for s, q in qty.items() if q}
+            rates = {s: _cost_rate(level, s, prices, "sell") for s in prices_k}
+            if spec.raise_method == "pro_rata":
+                plan = core_alloc.plan_raise_cash_pro_rata(day_date, held, prices_k, cash - spec.cash_reserve_usd,
+                                                           need + allowance, targets, cost_rate=rates,
+                                                           min_order_usd=spec.min_order_usd)
+            else:
+                plan = core_alloc.plan_raise_cash(day_date, held, prices_k, cash - spec.cash_reserve_usd,
+                                                  need + allowance, targets, cost_rate=rates,
+                                                  buffer_symbol=spec.buffer_symbol, min_order_usd=spec.min_order_usd)
             pending = _Pending(plan, value, need=need, tax=carried_tax)
             day.decided = "raise_cash"
         if pending is not None:
@@ -228,9 +242,10 @@ def _cost_rate(level: CostLevel, symbol: str, prices: Prices, side: str = "buy")
     return level.half_spread(symbol) + level.slippage_bps * costs.BPS + fee
 
 
-def _fill_phase1(prices: Prices, spec: Spec, k: int, level: CostLevel, fees: FeeTable, pending: _Pending,
-                 qty: dict[str, Decimal], cash: Decimal, day: Day) -> Decimal:
-    """``run_hold``'s arithmetic, unchanged: every symbol to ``value × w / open``, in ``spec.symbols`` order."""
+def _fill_phase1(prices: Prices, spec: Spec, k: int, level: CostLevel, fees: FeeTable, rounding: str,
+                 pending: _Pending, qty: dict[str, Decimal], cash: Decimal, day: Day) -> Decimal:
+    """``run_hold``'s arithmetic, unchanged: every symbol to ``value × w / open``, in ``spec.symbols`` order.
+    ``rounding`` is the profile's: ``per_order`` for PHASE1 (C7's twin changes it)."""
     day_date = prices.sessions[k].date
     for s in spec.symbols:
         open_ = prices.open(s, k)
@@ -241,7 +256,7 @@ def _fill_phase1(prices: Prices, spec: Spec, k: int, level: CostLevel, fees: Fee
         side = "buy" if delta > 0 else "sell"
         fill = costs.market_fill(side, open_, s, level, level.open_multiplier)
         amount = abs(delta)
-        charged = sum(fees.order_fees(day_date, side, amount, fill.price, "per_order").values(), ZERO)
+        charged = sum(fees.order_fees(day_date, side, amount, fill.price, rounding).values(), ZERO)
         if side == "buy":
             cash -= costs.cash_debit(amount, fill.price, level) + charged
         else:
@@ -298,7 +313,7 @@ def _fill_core(prices: Prices, spec: Spec, k: int, level: CostLevel, fees: FeeTa
         day.flow += paid - tax_paid
     available = cash - spec.cash_reserve_usd
     buys = core_alloc.scale_buys(pending.plan.buys, available,
-                                 {s: _cost_rate(level, s, prices) for s in pending.plan.buys})
+                                 {s: _cost_rate(level, s, prices) for s in pending.plan.buys}, cents=level.round_prices)
     for s in sorted(buys):
         notional = buys[s]
         if notional < spec.min_order_usd:
