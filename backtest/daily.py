@@ -169,6 +169,8 @@ class DailyView:
 
     def require(self, k: int) -> None:
         """Decision code may ask about session ``k`` only if it was published by now."""
+        if k >= len(self._market.sessions):
+            raise LookAheadError(f"session index {k} is beyond the data: not published at {self.at}")
         if self._market.decision_at(k) > self.at:
             raise LookAheadError(f"session {self._market.dates[k]} is not published at {self.at}")
 

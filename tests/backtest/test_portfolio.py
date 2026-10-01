@@ -153,6 +153,10 @@ def test_m4_weights_read_only_the_view(fees: FeeTable) -> None:
     assert w == w2
     with pytest.raises(LookAheadError):
         m.view(10).closes("VTI", 64)
+    last = len(m.sessions) - 1
+    for k in (last + 1, last + 5):  # a session beyond the data is unpublished, not an IndexError
+        with pytest.raises(LookAheadError):
+            m.view(last).require(k)
 
 
 def test_a_cash_need_is_raised_by_the_next_open_and_never_overdraws(fees: FeeTable) -> None:
