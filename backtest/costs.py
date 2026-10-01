@@ -152,9 +152,11 @@ class FeeRow:
     cap: Decimal | None
     start: date
     end: date | None
+    asset_class: str = "equity"
 
-    def applies(self, day: date, side: str) -> bool:
-        return self.side in {side, "both"} and self.start <= day and (self.end is None or day <= self.end)
+    def applies(self, day: date, side: str, asset_class: str = "equity") -> bool:
+        return (self.asset_class == asset_class and self.side in {side, "both"} and self.start <= day
+                and (self.end is None or day <= self.end))
 
 
 class FeeTable:
@@ -167,15 +169,17 @@ class FeeTable:
         raw = json.loads(path.read_text(encoding="utf-8"))
         rows = [FeeRow(r["fee"], r["side"], r["basis"], Decimal(r["rate"]),
                        Decimal(r["cap"]) if r["cap"] is not None else None, date.fromisoformat(r["from"]),
-                       date.fromisoformat(r["to"]) if r["to"] else None) for r in raw["fees"]]
+                       date.fromisoformat(r["to"]) if r["to"] else None, r.get("asset_class", "equity"))
+                for r in raw["fees"]]
         _check_coverage(rows)
         return cls(rows, raw["version"])
 
-    def exact(self, day: date, side: str, qty: Decimal, price: Decimal) -> dict[str, Decimal]:
+    def exact(self, day: date, side: str, qty: Decimal, price: Decimal,
+              asset_class: str = "equity") -> dict[str, Decimal]:
         """Each fee type's exact amount for one order, before any rounding."""
         out: dict[str, Decimal] = {}
         for row in self.rows:
-            if not row.applies(day, side):
+            if not row.applies(day, side, asset_class):
                 continue
             amount = row.rate * (qty * price if row.basis == "principal" else qty)
             if row.cap is not None:
@@ -183,10 +187,17 @@ class FeeTable:
             out[row.fee] = out.get(row.fee, Decimal(0)) + amount
         return out
 
-    def order_fees(self, day: date, side: str, qty: Decimal, price: Decimal, rounding: str) -> dict[str, Decimal]:
+    def covered_from(self, asset_class: str = "equity") -> date:
+        """The first day every fee type of ``asset_class`` has a row: a run starting earlier
+        would charge some fee type nothing, silently (design §1, fact 2)."""
+        return max(min(r.start for r in self.rows if r.fee == fee and r.asset_class == asset_class)
+                   for fee in {r.fee for r in self.rows if r.asset_class == asset_class})
+
+    def order_fees(self, day: date, side: str, qty: Decimal, price: Decimal, rounding: str,
+                   asset_class: str = "equity") -> dict[str, Decimal]:
         """What one order is charged now: rounded up per fee type (``per_order``),
         or exact, with the daily rounding settled by ``DailyFees`` (``daily``)."""
-        exact = self.exact(day, side, qty, price)
+        exact = self.exact(day, side, qty, price, asset_class)
         if rounding == "per_order":
             return {k: v.quantize(CENT, rounding=ROUND_CEILING) for k, v in exact.items()}
         if rounding in {"daily", "none"}:
@@ -195,10 +206,10 @@ class FeeTable:
 
 
 def _check_coverage(rows: list[FeeRow]) -> None:
-    """A fee must never silently stop applying: per fee type, consecutive
+    """A fee must never silently stop applying: per fee type and asset class, consecutive
     rows without gaps or overlaps, the last one open-ended."""
-    for fee in {r.fee for r in rows}:
-        mine = sorted((r for r in rows if r.fee == fee), key=lambda r: r.start)
+    for fee, asset_class in {(r.fee, r.asset_class) for r in rows}:
+        mine = sorted((r for r in rows if (r.fee, r.asset_class) == (fee, asset_class)), key=lambda r: r.start)
         for before, after in itertools.pairwise(mine):
             if before.end is None or after.start != before.end + timedelta(days=1):
                 raise ValueError(f"fees.json: {fee} rows from {before.start} and {after.start} leave a gap or overlap")
