@@ -28,6 +28,8 @@ from backtest.daily import DailyMarket
 from backtest.portfolio import Day
 
 TRADING_DAYS = metrics.TRADING_DAYS
+#: "Higher" in the raise-cash table means by more than a cent: sub-cent rounding is not a difference.
+HIGHER = 0.01
 
 
 @dataclass
@@ -182,7 +184,8 @@ def _summary(run: Run, window: Window | None) -> dict[str, Any]:
         "longest_underwater_from": when(dd.longest_under_from), "longest_underwater_to": when(dd.longest_under_to),
         "worst_year": min((y for y in by_year if first_year < y < last_year), key=lambda y: by_year[y],
                           default=min(by_year, key=lambda y: by_year[y])),
-        "turnover_per_year": float(np.sum(run.traded)) / 2 / mean_value / n_years,
+        # One-way turnover after the initial build: buying the mix on day one is not turnover.
+        "turnover_per_year": float(np.sum(run.traded[1:])) / 2 / mean_value / n_years,
         "rebalances_per_year": float(np.sum(run.rebalanced[1:])) / n_years,
         "deferrals": int(np.sum(run.deferred)),
         "exec_cost_bps_per_year": float(np.sum(run.exec_cost)) / mean_value / n_years * 1e4,
@@ -304,7 +307,8 @@ def build(runs: Mapping[str, Run], market: DailyMarket, *, registration_id: str,
     # 3. rebalancing
     lines += ["## 3. Does rebalancing help, and how often?", "",
               ("Each rule against buying the same mix once and never touching it ('none'). Δ mean is the mean daily "
-              "return difference; R2 reads R1 on it (return) and on the volatility difference (risk)."), ""]
+              "return difference; R2 reads R1 on it (return) and on the volatility difference (risk). Turnover "
+              "excludes the initial purchase."), ""]
     for mix in G.BASE_MIXES:
         none = {lv: get("core", "full", mix, "none", lv).returns() for lv in G.LEVELS}
         rows = []
@@ -503,7 +507,7 @@ def raise_cash_section(runs: Mapping[str, Run], market: DailyMarket, m: dict[str
              ("If you need X by a date, this plan sells free cash first, then the buffer, then whatever is most "
              "over-weight after the withdrawal, and only then pro rata. The baseline sells every holding pro rata. "
              "Same needs, same dates (the four stress troughs and 20 seeded dates), central level, $10,000. "
-             "Value one year later compares what the two plans left behind."), ""]
+             "Value one year later compares what the two plans left behind; 'higher' means by more than a cent."), ""]
     rows = []
     for (mix, buffer, rule, amount), items in sorted(agg.items()):
         n = len(items)
@@ -513,10 +517,10 @@ def raise_cash_section(runs: Mapping[str, Run], market: DailyMarket, m: dict[str
                      f"${np.mean([i['plan_cost'] for i in items]):.2f} vs ${np.mean([i['pro_rata_cost'] for i in items]):.2f}",
                      (f"{pct(float(np.mean([i['plan_drift'] for i in items])))} vs "
                      f"{pct(float(np.mean([i['pro_rata_drift'] for i in items])))}"),
-                     f"${np.mean(diff):+,.2f} ({sum(d > 0 for d in diff)} of {n} higher)",
+                     f"${np.mean(diff):+,.2f} ({sum(d > HIGHER for d in diff)} of {n} higher)",
                      f"${np.mean(trough_diff):+,.2f}" if trough_diff else "—"])
         m[f"raise_cash:{mix}:{buffer}:{rule}:{amount}"] = {"mean_value_1y_diff": float(np.mean(diff)),
-                                                          "plan_higher": int(sum(d > 0 for d in diff)), "n": n}
+                                                          "plan_higher": int(sum(d > HIGHER for d in diff)), "n": n}
     lines += table(["Mix", "Buffer", "Rule", "Need", "Sale cost (plan vs pro rata)", "Drift after",
                     "Value 1 year later, plan − pro rata", "At the 4 stress troughs"], rows)
     return lines

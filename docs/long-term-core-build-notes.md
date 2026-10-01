@@ -56,3 +56,24 @@ period.
 
 **On the edge:** M1's maximum drawdown is -34.98% at the pessimistic level against the owner's -35%:
 "within your tolerance" by 0.02 points.
+
+## Second run, after review fixes (2026-10-01)
+
+A review of the first run found three low-severity issues, fixed in commit 5493a47:
+
+1. Buys reserved the spread and slippage on top of a fill price that already contains them, so that
+   fraction sat idle as cash (M1 'none' kept $5.50 of $10,000). Buys now reserve only fees plus an
+   explicit cent-rounding allowance; idle cash is the $1 reserve plus cents. This was the root cause of
+   M1's "helps on return" artifact: the one $4.49 trade was this idle cash being swept.
+2. Turnover counted the initial purchase; it no longer does.
+3. The raise-cash table counted sub-cent noise as "higher"; it now needs more than a cent.
+
+C11's twin was also strengthened to forward-fill a bar through the served market.
+
+Run `x-20261001-121225-9c4ebec5` (run-core **2 of 2** on this window, same registration
+`x-20261001-112412-3f5633a7`, checks `x-20261001-121158-87ca6a16` at 5493a47), reproduced exactly as
+`x-20261001-121518-6c66ad74` (report hash 4100e37d…). Against the first run: every figure moves by
+rounding only (CAGRs within 0.01 point); the only verdict that changes is M1's, now "indistinguishable on
+this history" under every rule. All other R2 and R3 verdicts, and sections 1 and 2, are unchanged. Both
+runs stay in the registry; this one is the one to cite. R1's missing materiality threshold remains a
+flaw of the registration, now without a visible symptom.
