@@ -197,3 +197,38 @@ def test_raise_cash_refuses_more_than_the_portfolio() -> None:
     with pytest.raises(ValueError, match="exceeds_portfolio"):
         ca.plan_raise_cash(date(2025, 3, 3), {"A": D("1")}, {"A": D("100")}, D("0"), D("100"), {"A": D("1")},
                            cost_rate={"A": D("0.01")})
+
+
+# --- compound metrics (core design §5.1) ------------------------------------------------------------------------
+
+def test_the_shared_index_matrix_is_block_bootstraps_own_resamples() -> None:
+    import numpy as np
+
+    from backtest import metrics as m
+
+    rng = np.random.default_rng(0)
+    assert (m.index_matrix(300, resamples=40, seed=0) == np.array([m.stationary_indices(300, 5, rng)
+                                                                   for _ in range(40)])).all()
+    x = np.random.default_rng(1).normal(0.0004, 0.01, 300)
+    phase1 = m.block_bootstrap(x, np.mean, n=500, seed=3)
+    shared = m.interval_from(float(np.mean(x)), m.resampled(lambda r: r.mean(axis=-1),
+                                                            m.index_matrix(300, resamples=500, seed=3), x),
+                             resamples=500, seed=3)
+    assert (shared.low, shared.high) == (phase1.low, phase1.high)
+
+
+def test_drawdown_is_compound_with_dates_and_the_longest_spell() -> None:
+    import numpy as np
+
+    from backtest import metrics as m
+
+    r = np.array([0.10, -0.50, 0.20, 0.30, 1.0, -0.01])
+    d = m.drawdown_detail(r)
+    assert d.depth == pytest.approx(-0.5) and (d.peak, d.trough, d.recovery) == (1, 2, 5)
+    assert (d.longest_under, d.longest_under_from, d.longest_under_to, d.open_at_end) == (3, 1, 5, False)
+    # Additive would say -0.5 + 0.2 + ... ; compound says the path halved: -50%.
+    assert float(m.compound_drawdown(r)) == pytest.approx(-0.5)
+    open_end = m.drawdown_detail(np.array([0.1, -0.2, 0.05, 0.01]))
+    assert open_end.open_at_end and open_end.recovery is None and open_end.longest_under == 3
+    assert m.year_returns([0.1, 0.1, -0.5], [2020, 2020, 2021]) == {2020: pytest.approx(0.21), 2021: -0.5}
+    assert float(m.cagr(np.full(252, (1.07) ** (1 / 252) - 1))) == pytest.approx(0.07)
