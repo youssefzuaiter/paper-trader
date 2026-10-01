@@ -46,3 +46,18 @@ def test_run_core_refuses_a_registration_whose_grid_changed() -> None:
         assert core_runs.registered(store, "x-ok")["sizes_usd"] == ["100000", "10000"]
         with pytest.raises(PermissionError, match="no passing leakage-core"):
             core_runs.passing_leakage(store, "0" * 40)
+
+
+def test_registration_writes_its_report_with_decimal_parameters(tmp_path: Path) -> None:
+    """The grid's cost levels carry Decimals; the registration's report must serialise them."""
+    written = {}
+
+    def capture(_root, _exp, _name, body, _store) -> Path:
+        written["body"] = body
+        return tmp_path / "r.md"
+
+    params = {"root": str(tmp_path), "registration": registration_params(), "supersedes": None}
+    with Store() as store:
+        out = core_runs.cmd_register_core(params, store, allow_dirty=True, parent_id=None, write_report=capture)
+        assert store.experiment(out["experiment"])["status"] == "done"
+    assert '"half_spread_bps"' in written["body"] and "History warning" in written["body"]

@@ -143,7 +143,7 @@ def cmd_register_core(params: dict[str, Any], store: Store, *, allow_dirty: bool
         reg = params["registration"]
         body = "\n".join(["# Core registration", "", f"> {reg['not_advice']}", "",
                           f"> **History warning.** {reg['history_warning']}", "",
-                          "```json", json.dumps(reg, indent=1, sort_keys=True), "```", ""])
+                          "```json", json.dumps(reg, indent=1, sort_keys=True, default=str), "```", ""])
         exp.finish({"grid_runs": reg["grid_runs"]}, report_body=body, conclusion="registered")
         write_report(root, exp, "core-registration", body, store)
     if parent_id is None and params.get("supersedes"):
