@@ -52,8 +52,13 @@ class CostLevel:
     limit_fill_at_limit: bool          # True: pay L (pessimistic); False: min(L, o(1+hm+σ))
     fee_rounding: str                  # per_order | daily
     round_prices: bool = True          # False only for the frictionless consistency check
+    #: Measured per-symbol half-spreads (the long-term core's instruments); they win over the two groups.
+    half_spread_bps_by_symbol: tuple[tuple[str, Decimal], ...] = ()
 
     def half_spread(self, symbol: str) -> Decimal:
+        measured = dict(self.half_spread_bps_by_symbol)
+        if symbol in measured:
+            return measured[symbol] * BPS
         bps = self.half_spread_bps_tight if symbol in TIGHT else self.half_spread_bps_wide
         return bps * BPS
 
@@ -66,6 +71,29 @@ LEVELS: Final[dict[str, CostLevel]] = {
     "central": CostLevel("central", Decimal("1.5"), Decimal("2.5"), Decimal("2"), Decimal("2"), False, "daily"),
     "pessimistic": CostLevel("pessimistic", Decimal("4"), Decimal("6"), Decimal("3"), Decimal("5"), True, "per_order"),
 }
+#: The long-term core's half-spreads (bps), measured by ``backtest.spreads.measure`` from the quote
+#: sample ``.cache/backtest/core/quotes_sample.parquet`` (sha256 3b12d115…dddfc, fetched 2026-10-01): the
+#: first minute after the open on 24 evenly spaced sessions 2016-2026 (BTC/USD: 22, from 2023, the first
+#: year Alpaca has crypto quotes; SGOV: 14, from 2020), percentiles 50/75/95 of per-session medians.
+#: The core trades at the open, so these are paid as measured, without phase 1's opening multiplier.
+CORE_HALF_SPREAD_BPS: Final[dict[str, tuple[str, str, str]]] = {
+    #          optimistic central pessimistic
+    "VTI": ("1.7", "2.4", "5.9"), "VXUS": ("2.9", "3.9", "8.3"), "BND": ("0.8", "1.4", "1.9"),
+    "IAU": ("2.1", "4.0", "4.3"), "VNQ": ("2.4", "3.7", "5.1"), "BIL": ("0.6", "0.6", "1.1"),
+    "SPY": ("0.2", "0.3", "0.5"), "IEF": ("0.6", "0.7", "3.7"), "TLT": ("0.5", "0.6", "0.8"),
+    "GLD": ("0.5", "0.6", "1.9"), "SGOV": ("0.5", "0.5", "1.0"), "BTC/USD": ("6.1", "7.0", "11.0"),
+}
+
+
+def _core_level(name: str, i: int) -> CostLevel:
+    from dataclasses import replace
+    return replace(LEVELS[name], half_spread_bps_by_symbol=tuple(
+        (s, Decimal(v[i])) for s, v in sorted(CORE_HALF_SPREAD_BPS.items())))
+
+
+#: Phase 1's three levels (slippage, fee rounding) with the core's measured spreads.
+CORE_LEVELS: Final[dict[str, CostLevel]] = {name: _core_level(name, i) for i, name in enumerate(LEVELS)}
+
 #: No spread, slippage, fees or rounding: only for checking the engine against labels (L4b).
 FRICTIONLESS: Final[CostLevel] = CostLevel("frictionless", Decimal(0), Decimal(0), Decimal(1), Decimal(0), False,
                                            "none", round_prices=False)
