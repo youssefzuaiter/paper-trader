@@ -229,17 +229,27 @@ def _weights_ex_cash(qty: dict[str, Decimal], closes: dict[str, Decimal]) -> dic
     return {s: v / total for s, v in values.items()} if total > 0 else {}
 
 
-def _cost_rate(level: CostLevel, symbol: str, prices: Prices, side: str = "buy") -> Decimal:
-    """Expected cost of one order as a fraction of notional: spread, slippage and a fee allowance,
-    so buys scaled to the cash available leave it non-negative (design §3.1 c). Equity buys pay
-    only CAT (a fraction of a basis point); crypto pays its 0.25% on both sides."""
+def _fee_rate(level: CostLevel, symbol: str, prices: Prices, side: str) -> Decimal:
+    """A fee allowance as a fraction of notional: equity buys pay only CAT (a fraction of a basis
+    point), sells add SEC and TAF; crypto pays its 0.25% on both sides."""
     if level.fee_rounding == "none":
-        fee = ZERO
-    elif prices.asset_class(symbol) == "crypto":
-        fee = Decimal("0.0025")
-    else:
-        fee = Decimal("0.00001") if side == "buy" else Decimal("0.0001")  # sells add SEC and TAF
-    return level.half_spread(symbol) + level.slippage_bps * costs.BPS + fee
+        return ZERO
+    if prices.asset_class(symbol) == "crypto":
+        return Decimal("0.0025")
+    return Decimal("0.00001") if side == "buy" else Decimal("0.0001")
+
+
+def _buy_fee_rate(level: CostLevel, symbol: str, prices: Prices) -> Decimal:
+    """What a buy costs on top of its notional. A buy of notional N fills N / price units at a price
+    that already includes the spread and slippage, so it debits about N: only the fee is extra
+    (design §3.1 c). Cent rounding of the debit is covered by the cash reserve."""
+    return _fee_rate(level, symbol, prices, "buy")
+
+
+def _cost_rate(level: CostLevel, symbol: str, prices: Prices, side: str = "sell") -> Decimal:
+    """What a sale loses of its value at the decision close: spread, slippage and fees. A raise-cash
+    plan grosses its sells up by this."""
+    return level.half_spread(symbol) + level.slippage_bps * costs.BPS + _fee_rate(level, symbol, prices, side)
 
 
 def _fill_phase1(prices: Prices, spec: Spec, k: int, level: CostLevel, fees: FeeTable, rounding: str,
@@ -311,9 +321,14 @@ def _fill_core(prices: Prices, spec: Spec, k: int, level: CostLevel, fees: FeeTa
         cash -= paid
         day.tax += tax_paid
         day.flow += paid - tax_paid
-    available = cash - spec.cash_reserve_usd
+    # Each buy's debit rounds up to the cent and its fees may each round up a cent (three equity fee
+    # types); the day's fee rounding adds up to a cent per fee type. Budget for all of it, so cash
+    # never goes negative even without a reserve (C8).
+    rounding_allowance = core_alloc.CENT * (4 * len(pending.plan.buys) + 4) if level.round_prices else ZERO
+    available = cash - spec.cash_reserve_usd - rounding_allowance
     buys = core_alloc.scale_buys(pending.plan.buys, available,
-                                 {s: _cost_rate(level, s, prices) for s in pending.plan.buys}, cents=level.round_prices)
+                                 {s: _buy_fee_rate(level, s, prices) for s in pending.plan.buys},
+                                 cents=level.round_prices)
     for s in sorted(buys):
         notional = buys[s]
         if notional < spec.min_order_usd:

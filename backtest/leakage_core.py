@@ -502,24 +502,33 @@ def c10_registration_lock(*, guard: bool = True) -> Check:
 
 def c11_completeness(market: DailyMarket, paths: CorePaths, *, forward_fill_gap: bool = False) -> Check:
     """Every instrument has a raw-file bar for every session from its warm-up to the window's end, and the
-    market serves exactly those bars: nothing filled. ``forward_fill_gap``: one bar removed from the raw
-    rows and forward-filled by the loader (the twin)."""
+    market serves exactly the file's prices for it: nothing missing, nothing filled. ``forward_fill_gap``
+    (the twin): one session's bar is replaced by the previous session's, as a forward-filling loader would."""
     from backtest import parquet
-    raw = {(r["symbol"], r["t"].astimezone(NEW_YORK).date()) for r in parquet.read_rows(paths.daily("all"))}
+    file_bars = {(r["symbol"], r["t"].astimezone(NEW_YORK).date()): (r["o"], r["c"])
+                 for r in parquet.read_rows(paths.daily("all"))}
     served = market
     if forward_fill_gap:
-        gap_day = market.dates[market.index(G.WINDOWS["full"][0]) + 100]
-        raw.discard(("VTI", gap_day))
-        served = with_closes(market, lambda s, c: c, ())  # the loader forward-fills: the bar is still served
+        gap = market.index(G.WINDOWS["full"][0]) + 100
+        served = copy.copy(market)
+        served._open = dict(market._open)
+        served._close = dict(market._close)
+        served._open["VTI"] = list(market._open["VTI"])
+        served._close["VTI"] = list(market._close["VTI"])
+        served._open["VTI"][gap] = market._open["VTI"][gap - 1]
+        served._close["VTI"][gap] = market._close["VTI"][gap - 1]
     first, last = _window("full", market)
     problems: list[str] = []
     for s in ETFS:
         start = max(first - G.LOOKBACK - 1, served.first_index(s))
         for k in range(start, last + 1):
-            if (s, market.dates[k]) not in raw:
+            bar = file_bars.get((s, market.dates[k]))
+            if bar is None:
                 problems.append(f"{s} {market.dates[k]}: no bar in the raw file")
             elif not served.has(s, k):
                 problems.append(f"{s} {market.dates[k]}: in the file, not served")
+            elif (served._open[s][k], served._close[s][k]) != bar:
+                problems.append(f"{s} {market.dates[k]}: served {served._close[s][k]}, the file has {bar[1]}")
     b_first, _ = _window("crypto", market)
     missing_btc = [market.dates[k].isoformat() for k in range(b_first - G.LOOKBACK - 1, last + 1)
                    if not market.has(BTC, k)]
