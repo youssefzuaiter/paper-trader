@@ -39,3 +39,20 @@
 5. `python -m backtest reproduce <run-core id>`: identical metrics and report hash.
 
 No core performance number was printed or read before step 3; dry runs printed structure only.
+
+## Results and what they taught (2026-10-01)
+
+Registration `x-20261001-112412-3f5633a7`, checks `x-20261001-112250-98f74c76` (all 26 rows pass), run
+`x-20261001-112421-9bfa07ac` at commit b8bdeb6, reproduced exactly as `x-20261001-112713-3ee8a03c`
+(report hash dfb49052…). Report: `.cache/backtest/reports/run-core.md`.
+
+**A flaw in the registered reading rule R1, found in the results:** R1 has no minimum effect size. For M1
+(100% VTI) the calendar rules only ever sweep idle cash: one $4.49 trade in ten years, worth about $14. The
+two return series are nearly identical, so the paired interval is microscopically narrow, excludes zero,
+and R1 prints "helps on return; adds risk". The registered rule stands for this run (it cannot be changed
+after the results). A future registration should add a materiality threshold (for example, a difference
+must exceed one basis point a year) and apply it only to evidence gathered after it, such as the paper
+period.
+
+**On the edge:** M1's maximum drawdown is -34.98% at the pessimistic level against the owner's -35%:
+"within your tolerance" by 0.02 points.
