@@ -219,3 +219,33 @@ def test_a_code_file_keeps_its_path_when_data_lives_elsewhere(tmp_path: Path) ->
     assert [f["path"] for f in recorded["files"]] == sorted(["data.txt", "backtest/fees.json"])
     with pytest.raises(ValueError):
         manifest([Path("/etc/hosts")], tmp_path)
+
+
+def test_a_later_commit_editing_a_code_input_does_not_break_an_older_reproduction(tmp_path: Path) -> None:
+    """Design O16: extending ``fees.json`` in a later commit must leave earlier experiments
+    reproducible. Code-shipped inputs are checked in the recorded commit's worktree; data inputs
+    are still checked against the data root, so a changed data file is still caught."""
+    repo = fresh_repo(tmp_path / "r")
+    (repo / ".gitignore").write_text("data/\n")
+    (repo / "fees.json").write_text('{"v": 1}')
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "fees v1")
+    (repo / "data").mkdir()
+    (repo / "data" / "bars.txt").write_text("bars")
+    recorded = registry.manifest([repo / "fees.json", repo / "data" / "bars.txt"], repo)
+    commit = git(repo, "rev-parse", "HEAD").strip()
+
+    (repo / "fees.json").write_text('{"v": 2}')  # a later commit adds fee rows
+    git(repo, "commit", "-qam", "fees v2")
+    with pytest.raises(registry.ManifestMismatch):  # the old check: against the current tree
+        registry.verify(recorded, repo)
+
+    worktree = tmp_path / "tree"
+    git(repo, "worktree", "add", "--detach", str(worktree), commit)
+    tracked = frozenset(git(worktree, "ls-files").splitlines())
+    assert "fees.json" in tracked and "data/bars.txt" not in tracked
+    registry.verify(recorded, repo, code_root=worktree, code_files=tracked)
+
+    (repo / "data" / "bars.txt").write_text("changed bars")
+    with pytest.raises(registry.ManifestMismatch, match="data/bars.txt"):
+        registry.verify(recorded, repo, code_root=worktree, code_files=tracked)
