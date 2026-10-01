@@ -139,6 +139,25 @@ CREATE TABLE IF NOT EXISTS run (
     metrics        JSON
 );
 
+-- The long-term core (core design §1): one row per run and session, end of day.
+CREATE TABLE IF NOT EXISTS core_day (
+    run_id      VARCHAR NOT NULL,            -- the run table's id
+    day         DATE NOT NULL,
+    value       DECIMAL(20,6) NOT NULL,      -- mark-to-market at the adjusted close, after costs
+    cash        DECIMAL(20,6) NOT NULL,
+    weights     JSON NOT NULL,               -- symbol -> share of value
+    traded      DECIMAL(20,6) NOT NULL,      -- notional at the fills' reference opens
+    exec_cost   DECIMAL(20,6) NOT NULL,      -- spread + slippage + tick rounding
+    fees        DECIMAL(20,6) NOT NULL,
+    tax         DECIMAL(20,6) NOT NULL,      -- illustrative
+    flow        DECIMAL(20,6) NOT NULL,      -- cash withdrawn by the owner (not a return)
+    rebalanced  BOOLEAN NOT NULL,
+    deferred    BOOLEAN NOT NULL,            -- the breaker blocked a plan with buys
+    decided     VARCHAR,                     -- what this close decided
+    orders      JSON,                        -- the fills, when any
+    PRIMARY KEY (run_id, day)
+);
+
 -- One row per trade: its lifecycle folded, P&L split into gross (at the
 -- fill bars' opens), spread, slippage, other (limit price and cent
 -- rounding), fees and net. Daily fee-rounding rows (trade_id 'fees') are

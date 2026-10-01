@@ -30,9 +30,10 @@ from typing import Final
 
 import numpy as np
 
-from backtest import costs
+from backtest import portfolio
 from backtest.calendar import Calendar, Session
 from backtest.costs import CostLevel, FeeTable
+from backtest.daily import Phase1Prices
 from backtest.data import MarketData
 from backtest.dataset import Samples
 from backtest.engine import PendingSignal
@@ -268,44 +269,11 @@ def run_hold(market: MarketData, symbols: Sequence[str], sessions: Sequence[Sess
     month's first session, if any weight at the previous close is outside
     12.5% +/- ``band``, every symbol is rebalanced to 12.5%. Orders are
     decided after a close and filled at the next open, market, ± h·m + σ
-    (the open is in the opening window, so m applies), adjusted prices."""
-    closes = {s: {b.t.astimezone(NEW_YORK).date(): b for b in market.daily[s]} for s in symbols}
-    cash, qty = capital, {s: Decimal(0) for s in symbols}
-    target = Decimal(1) / len(symbols)
-    out: list[DailyDay] = []
-    for k, session in enumerate(sessions):
-        traded = cost = Decimal(0)
-        rebalance = k == 0 or (band is not None and session.date.month != sessions[k - 1].date.month
-                               and _outside_band(qty, closes, sessions[k - 1].date, target, band))
-        if rebalance:
-            value = cash + sum((qty[s] * Decimal(repr(closes[s][sessions[k - 1].date].c)) for s in symbols),
-                               Decimal(0)) if k else capital
-            for s in symbols:
-                bar = closes[s][session.date]
-                open_ = Decimal(repr(bar.o))
-                want = (value * target / open_).quantize(Decimal("0.000000001"), rounding=ROUND_DOWN)
-                delta = want - qty[s]
-                if delta == 0:
-                    continue
-                side = "buy" if delta > 0 else "sell"
-                fill = costs.market_fill(side, open_, s, level, level.open_multiplier)
-                amount = abs(delta)
-                # $100k per rebalance: fee rounding is immaterial here; per order is the conservative reading
-                charged = sum(fees.order_fees(session.date, side, amount, fill.price, "per_order").values(), Decimal(0))
-                if side == "buy":
-                    cash -= costs.cash_debit(amount, fill.price, level) + charged
-                else:
-                    cash += costs.cash_credit(amount, fill.price, level) - charged
-                qty[s] = want
-                traded += amount * open_
-                cost += amount * abs(fill.price - open_) + charged
-        value = cash + sum((qty[s] * Decimal(repr(closes[s][session.date].c)) for s in symbols), Decimal(0))
-        out.append(DailyDay(session.date, value, traded, cost))
-    return out
+    (the open is in the opening window, so m applies), adjusted prices.
 
-
-def _outside_band(qty: Mapping[str, Decimal], closes: Mapping[str, Mapping[date, object]], day: date,
-                  target: Decimal, band: Decimal) -> bool:
-    values = {s: qty[s] * Decimal(repr(closes[s][day].c)) for s in qty}
-    total = sum(values.values(), Decimal(0))
-    return total > 0 and any(abs(v / total - target) > band for v in values.values())
+    Runs through the long-term core's engine in its ``PHASE1`` profile (core
+    design §3.4); check C7 holds it to the golden file from commit f700c0d."""
+    prices = Phase1Prices(market.daily, symbols, sessions)
+    days = portfolio.simulate(prices, portfolio.hold_spec(symbols, capital=capital, band=band), 0, len(sessions) - 1,
+                              level, fees, portfolio.PHASE1)
+    return [DailyDay(d.date, d.value, d.traded, d.costs) for d in days]

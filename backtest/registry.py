@@ -13,7 +13,8 @@ A report is a provenance header (ids, times, configuration counts) above a
 body; the **body** is hashed, so a faithful reproduction has the same hash.
 
 ``reproduce`` checks the recorded commit out into a temporary worktree,
-verifies the manifest, re-runs the command with the recorded parameters and
+verifies the manifest (code-shipped inputs against that commit, data against
+the data root), re-runs the command with the recorded parameters and
 seeds, and requires identical metrics and report hash.
 """
 
@@ -96,9 +97,13 @@ def manifest(paths: Sequence[Path], root: Path) -> dict[str, Any]:
     return {"root": str(root.resolve()), "files": files, "hash": combined.hexdigest()}
 
 
-def verify(recorded: Mapping[str, Any], root: Path) -> None:
+def verify(recorded: Mapping[str, Any], root: Path, *, code_root: Path | None = None,
+           code_files: frozenset[str] = frozenset()) -> None:
+    """Every recorded input unchanged. A file in ``code_files`` (tracked at the recorded commit) is
+    checked under ``code_root``, the checked-out commit, not the current tree: inputs that ship with
+    the code (``backtest/fees.json``) may change in later commits without breaking older experiments."""
     for f in recorded["files"]:
-        path = root / f["path"]
+        path = (code_root if code_root is not None and f["path"] in code_files else root) / f["path"]
         if not path.exists():
             raise ManifestMismatch(f"{f['path']} is missing")
         if path.stat().st_size != f["size"] or sha256_file(path) != f["sha256"]:
@@ -217,11 +222,12 @@ def reproduce(store_path: Path, experiment_id: str, *, repo: Path = ROOT, python
     if original["status"] != "done":
         raise NotReproduced(f"{experiment_id} is {original['status']}, not done")
     recorded = json.loads(original["manifest"])
-    verify(recorded, Path(recorded["root"]))
     with tempfile.TemporaryDirectory(prefix="backtest-reproduce-") as tmp:
         worktree = Path(tmp) / "tree"
         git(repo, "worktree", "add", "--detach", str(worktree), original["git_commit"])
         try:
+            verify(recorded, Path(recorded["root"]), code_root=worktree,
+                   code_files=frozenset(git(worktree, "ls-files").splitlines()))
             env = {**os.environ, "PYTHONPATH": str(worktree),
                    "OMP_NUM_THREADS": json.loads(original["environment"]).get("OMP_NUM_THREADS") or "8"}
             args = [python, "-m", "backtest", "replay-experiment", experiment_id, "--store", str(store_path.resolve())]

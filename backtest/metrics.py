@@ -107,3 +107,126 @@ def deflated_sharpe(observed: float, trials_sharpes: Sequence[float], n_days: in
                                           + gamma * norm.ppf(1 - 1 / (n_trials * math.e))) if n_trials > 1 else 0.0
     denominator = math.sqrt(max(1 - skew * observed + (kurtosis - 1) / 4 * observed ** 2, 1e-12))
     return float(norm.cdf((observed - expected_max) * math.sqrt(max(n_days - 1, 1)) / denominator))
+
+
+# --- the long-term core: compound (wealth-path) metrics, core design §5.1 -----------------------------------
+#
+# Phase 1's ``max_drawdown`` and its report's totals add daily returns: harmless over 1.7 years, wrong over
+# 10.7. They stay as they are (phase 1 reproduces through them); the core uses these.
+
+def index_matrix(n: int, *, mean_block: int = MEAN_BLOCK, resamples: int = RESAMPLES, seed: int = 0) -> np.ndarray:
+    """``resamples`` stationary-bootstrap index rows of ``range(n)``, drawn with exactly the random calls,
+    in exactly the order, that ``block_bootstrap`` makes: row *j* equals its *j*-th resample. Vectorised;
+    every core series in a window is resampled with the same matrix, so paired differences are coherent."""
+    rng = np.random.default_rng(seed)
+    out = np.empty((resamples, n), dtype=np.int32)
+    positions = np.arange(n)
+    for j in range(resamples):
+        starts = rng.random(n) < 1.0 / mean_block
+        starts[0] = True
+        begin = rng.integers(0, n, size=n)
+        last_start = np.maximum.accumulate(np.where(starts, positions, 0))
+        out[j] = (begin[last_start] + positions - last_start) % n
+    return out
+
+
+def wealth(returns: np.ndarray) -> np.ndarray:
+    """W₀ = 1, Wₜ = Π(1 + r): the compound path, along the last axis."""
+    w = np.cumprod(1.0 + returns, axis=-1)
+    ones = np.ones(w.shape[:-1] + (1,))
+    return np.concatenate([ones, w], axis=-1)
+
+
+def cagr(returns: np.ndarray) -> np.ndarray | float:
+    """Compound annual growth, annualised by 252 sessions a year (along the last axis)."""
+    n = returns.shape[-1]
+    growth = np.exp(np.sum(np.log1p(returns), axis=-1))
+    return growth ** (TRADING_DAYS / n) - 1.0
+
+
+def volatility(returns: np.ndarray) -> np.ndarray | float:
+    return np.std(returns, axis=-1, ddof=1) * math.sqrt(TRADING_DAYS)
+
+
+def sharpe_excess(returns: np.ndarray, riskfree: np.ndarray) -> np.ndarray | float:
+    x = returns - riskfree
+    sd = np.std(x, axis=-1, ddof=1)
+    return np.where(sd > 0, np.mean(x, axis=-1) / np.where(sd > 0, sd, 1.0) * math.sqrt(TRADING_DAYS), 0.0)
+
+
+def sortino(returns: np.ndarray, riskfree: np.ndarray) -> np.ndarray | float:
+    x = returns - riskfree
+    downside = np.sqrt(np.mean(np.minimum(returns, 0.0) ** 2, axis=-1))
+    return np.where(downside > 0, np.mean(x, axis=-1) / np.where(downside > 0, downside, 1.0)
+                    * math.sqrt(TRADING_DAYS), 0.0)
+
+
+def compound_drawdown(returns: np.ndarray) -> np.ndarray | float:
+    """min over t of Wₜ / max₍ₛ≤ₜ₎ Wₛ − 1 (negative), along the last axis."""
+    w = wealth(returns)
+    return np.min(w / np.maximum.accumulate(w, axis=-1) - 1.0, axis=-1)
+
+
+def calmar(returns: np.ndarray) -> np.ndarray | float:
+    dd = compound_drawdown(returns)
+    return np.where(dd < 0, cagr(returns) / np.where(dd < 0, -dd, 1.0), np.inf)
+
+
+@dataclass(frozen=True)
+class Drawdown:
+    depth: float                 # negative, compound
+    peak: int                    # index into the wealth path (0 = before the first return)
+    trough: int
+    recovery: int | None         # first index back at the peak, None if never
+    longest_under: int           # longest spell below a previous peak, in sessions
+    longest_under_from: int
+    longest_under_to: int | None  # None: still under at the end
+    open_at_end: bool
+
+
+def drawdown_detail(returns: np.ndarray) -> Drawdown:
+    w = wealth(np.asarray(returns, dtype=float))
+    peak_path = np.maximum.accumulate(w)
+    depth_path = w / peak_path - 1.0
+    trough = int(np.argmin(depth_path))
+    peak = int(np.argmax(w[: trough + 1]))
+    after = np.flatnonzero(w[trough:] >= w[peak])
+    recovery = trough + int(after[0]) if len(after) else None
+    longest, start, best_from, best_to = 0, None, 0, None
+    for k in range(len(w)):
+        if w[k] < peak_path[k]:
+            start = k - 1 if start is None else start  # the spell starts at its peak
+            if k - start > longest:
+                longest, best_from, best_to = k - start, start, None
+        else:
+            if start is not None and start == best_from:
+                best_to = k  # the longest spell recovered here
+            start = None
+    return Drawdown(float(depth_path[trough]), peak, trough, recovery, longest, best_from, best_to,
+                    start is not None and start == best_from)
+
+
+def year_returns(returns: Sequence[float], years: Sequence[int]) -> dict[int, float]:
+    """Compound return per calendar year (the first and last may be partial)."""
+    out: dict[int, float] = {}
+    for r, y in zip(returns, years, strict=True):
+        out[y] = (1.0 + out.get(y, 0.0)) * (1.0 + r) - 1.0
+    return out
+
+
+def interval_from(estimate: float, draws: np.ndarray, *, resamples: int, seed: int, level: float = 0.95) -> Interval:
+    draws = np.asarray(draws, dtype=float)
+    draws = draws[np.isfinite(draws)]
+    tail = (1 - level) / 2
+    return Interval(float(estimate), float(np.quantile(draws, tail)), float(np.quantile(draws, 1 - tail)),
+                    resamples, seed)
+
+
+def resampled(stat: Callable[..., np.ndarray], indices: np.ndarray, *series: np.ndarray,
+              chunk: int = 1000) -> np.ndarray:
+    """``stat`` on every resample row, in chunks (memory: chunk × n floats per series)."""
+    out = np.empty(len(indices))
+    for lo in range(0, len(indices), chunk):
+        rows = indices[lo:lo + chunk]
+        out[lo:lo + chunk] = stat(*(s[rows] for s in series))
+    return out

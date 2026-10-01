@@ -70,6 +70,12 @@ def fees() -> FeeTable:
 
 
 @pytest.mark.parametrize(("day", "sec_per_million"), [
+    # 2016-2023: the long-term core's history (design §1, fact 2), each step on both sides.
+    (date(2016, 2, 15), D("18.4")), (date(2016, 2, 16), D("21.8")), (date(2017, 7, 3), D("21.8")),
+    (date(2017, 7, 4), D("23.1")), (date(2018, 5, 22), D("13")), (date(2019, 4, 15), D("13")),
+    (date(2019, 4, 16), D("20.7")), (date(2020, 2, 18), D("22.1")), (date(2021, 2, 24), D("22.1")),
+    (date(2021, 2, 25), D("5.1")), (date(2022, 5, 14), D("22.9")), (date(2023, 2, 26), D("22.9")),
+    (date(2023, 2, 27), D("8")),
     (date(2024, 5, 21), D("8")), (date(2024, 5, 22), D("27.8")), (date(2025, 5, 13), D("27.8")),
     (date(2025, 5, 14), D("0")), (date(2026, 4, 3), D("0")), (date(2026, 4, 4), D("20.6")),
 ])
@@ -83,6 +89,25 @@ def test_taf_by_year_and_its_cap(fees: FeeTable) -> None:
     assert fees.exact(date(2026, 1, 2), "sell", D("100"), D("10"))["taf"] == D("0.0195")
     assert fees.exact(date(2026, 1, 2), "sell", D("100000"), D("10"))["taf"] == D("9.79")
     assert set(fees.exact(date(2026, 1, 2), "buy", D("1"), D("10"))) == {"cat"}  # buys pay CAT only
+    for day, rate, cap in ((date(2016, 1, 4), "0.000119", "5.95"), (date(2021, 12, 31), "0.000119", "5.95"),
+                           (date(2022, 1, 3), "0.000130", "6.49"), (date(2023, 12, 29), "0.000145", "7.27")):
+        assert fees.exact(day, "sell", D("100"), D("10"))["taf"] == D(rate) * 100
+        assert fees.exact(day, "sell", D("1000000"), D("10"))["taf"] == D(cap)
+
+
+def test_no_fee_type_is_silently_missing_from_2016(fees: FeeTable) -> None:
+    """Before these rows, a 2016-2022 sale paid nothing, with no error. CAT before 2024 is an
+    explicit zero row (no CAT fee was assessed then), not a gap."""
+    assert fees.covered_from("equity") == date(2016, 1, 1)
+    assert set(fees.exact(date(2018, 6, 1), "sell", D("100"), D("100"))) == {"sec", "taf", "cat"}
+    assert fees.exact(date(2018, 6, 1), "sell", D("100"), D("100"))["cat"] == 0
+
+
+def test_crypto_pays_only_the_crypto_fee_and_equities_never_do(fees: FeeTable) -> None:
+    assert fees.covered_from("crypto") == date(2021, 1, 1)
+    for side in ("buy", "sell"):
+        assert fees.exact(date(2022, 1, 3), side, D("0.02"), D("50000"), "crypto") == {"crypto": D("2.5")}
+        assert "crypto" not in fees.exact(date(2022, 1, 3), side, D("10"), D("100"))
 
 
 def test_the_fee_table_is_alpacas_schedule_of_2026_09_17(fees: FeeTable) -> None:
