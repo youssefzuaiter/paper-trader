@@ -12,6 +12,7 @@ registers an experiment before computing anything (design §8).
     register-core       the core's whole grid, reading rules and the owner's tolerance, before any core result
     leakage-core        checks C1-C12 for the core, each beside a broken twin that must fail
     run-core ID         every registered core configuration and the report (ID: the registration)
+    fx-core             the core's mixes translated into shekels (Bank of Israel USD/ILS), a registered study
     experiments         the registry, newest last
     reproduce ID        re-run an experiment from its commit; identical metrics and report hash or fail
 
@@ -37,7 +38,7 @@ from typing import Any, Final
 
 import numpy as np
 
-from backtest import core_runs, leakage, registry, runs
+from backtest import core_fx, core_runs, leakage, registry, runs
 from backtest import events as ev
 from backtest import report as reports
 from backtest.calendar import Calendar
@@ -324,6 +325,7 @@ COMMANDS: Final[dict[str, Callable[..., dict[str, Any]]]] = {
     core_runs.REGISTRATION: partial(core_runs.cmd_register_core, write_report=_write_report),
     core_runs.LEAKAGE: partial(core_runs.cmd_leakage_core, write_report=_write_report),
     core_runs.RUN: partial(core_runs.cmd_run_core, write_report=_write_report),
+    core_fx.COMMAND: partial(core_fx.cmd_fx_core, write_report=_write_report),
 }
 
 
@@ -339,8 +341,10 @@ def _defaults(command: str, args: argparse.Namespace) -> dict[str, Any]:
     if command == "criteria":
         params.update({"order_notional_usd": str(args.order_notional), "pass_rule": args.pass_rule,
                        "lockbox_criteria": args.lockbox_criteria})
-    if command in ("ingest-core", core_runs.REGISTRATION, core_runs.LEAKAGE, core_runs.RUN):
+    if command in ("ingest-core", core_runs.REGISTRATION, core_runs.LEAKAGE, core_runs.RUN, core_fx.COMMAND):
         params = {"root": params["root"]}
+    if command == core_fx.COMMAND:
+        params.update(core_fx.params())
     if command == core_runs.REGISTRATION:
         from backtest.core_grid import registration_params
         params.update({"registration": registration_params(), "supersedes": args.supersedes})
@@ -368,7 +372,7 @@ def main(argv: list[str] | None = None) -> int:
     crit.add_argument("--pass-rule", default=DEFAULT_PASS_RULE)
     crit.add_argument("--lockbox-criteria", required=True, help="what the lock-box must show to confirm (D5, D8)")
     crit.add_argument("--allow-dirty", action="store_true")
-    for name in ("ingest-core", "leakage-core"):
+    for name in ("ingest-core", "leakage-core", "fx-core"):
         sub.add_parser(name).add_argument("--allow-dirty", action="store_true")
     reg = sub.add_parser("register-core")
     reg.add_argument("--supersedes", default=None, help="the registration this one replaces (it still counts)")
