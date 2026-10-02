@@ -237,6 +237,30 @@ def order_submitted_at(order: dict[str, Any]) -> datetime:
     return datetime.fromisoformat(raw) if raw else datetime.now(UTC)
 
 
+# --- the long-term core's account is not this router's (core design §8.1) -----------
+
+CORE_POLICY: Final[Path] = Path(__file__).resolve().parent.parent / "policy" / "core.toml"
+
+
+class CoreAccountRefused(RuntimeError):
+    """The news router was started against the long-term core's account."""
+
+
+async def refuse_core_account(alpaca: Any, policy_path: Path | None = None) -> None:
+    """The news router's limits (a $50 gross cap, everything sold before the close) would dismantle a
+    long-term portfolio, so it refuses to start on the account the core policy names."""
+    path = policy_path or Path(os.getenv("CORE_POLICY_PATH", str(CORE_POLICY)))
+    if not path.exists():
+        return
+    import tier0_core
+    account = tier0_core.load_policy(path).account
+    if not account.startswith("PA"):
+        return  # the core account is not set yet
+    number = str((await alpaca.account()).get("account_number", ""))
+    if number == account:
+        raise CoreAccountRefused(f"account {number} belongs to the long-term core; the news router will not trade it")
+
+
 # --- app factory -----------------------------------------------------------------
 
 def build_router_from_env() -> RiskRouter:
@@ -250,6 +274,7 @@ def create_app(router: RiskRouter | None = None, *, background: bool = True) -> 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.router = router or build_router_from_env()
+        await refuse_core_account(app.state.router.alpaca)
         if app.state.router.guard.state.halted:
             logger.critical("Starting HALTED: %s", app.state.router.guard.state.halt_reason)
         tasks: list[asyncio.Task[None]] = []

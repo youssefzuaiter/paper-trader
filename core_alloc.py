@@ -135,6 +135,16 @@ RULES: Final[dict[str, Rule]] = {r.name: r for r in (
 )}
 
 
+def rebalance_due(rule: Rule, ends: frozenset[str], weights: Mapping[str, Decimal], targets: Mapping[str, Decimal],
+                  *, forced: bool = False) -> bool:
+    """Whether to plan a rebalance at this close: the one rule the backtest engine, the paper Allocator
+    and the core router all apply. ``forced``: a plan the loss breaker deferred is re-decided at this
+    close regardless of the period (design §3.1 a), though a band rule still needs its drift."""
+    if forced:
+        return rule.never or rule.band is None or drift(weights, targets) > rule.band
+    return rule.due(ends, weights, targets)
+
+
 def drift(weights: Mapping[str, Decimal], targets: Mapping[str, Decimal]) -> Decimal:
     """max |wᵢ − targetᵢ| in absolute weight (D6), over every symbol either side holds."""
     return max((abs(weights.get(s, Decimal(0)) - targets.get(s, Decimal(0))) for s in set(weights) | set(targets)),
