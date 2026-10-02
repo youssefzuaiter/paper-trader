@@ -77,3 +77,17 @@ rounding only (CAGRs within 0.01 point); the only verdict that changes is M1's, 
 this history" under every rule. All other R2 and R3 verdicts, and sections 1 and 2, are unchanged. Both
 runs stay in the registry; this one is the one to cite. R1's missing materiality threshold remains a
 flaw of the registration, now without a visible symptom.
+
+## The core in shekels (2026-10-02)
+
+The owner spends primarily in shekels and gave the go-ahead for a new data source: the Bank of Israel's
+representative USD/ILS rate (RER_USD_ILS, quoted with the source attributed). FRED has no shekel series
+(the Federal Reserve's H.10 list does not include it). `fx-core` (commit 5e3b94c, checks
+`x-20261002-144521-1527b27d`) is experiment `x-20261002-144550-d272c7ed`, reproduced exactly as
+`x-20261002-144604-0e366514` (report hash 910b67bd…). Report: `.cache/backtest/reports/fx-core.md`.
+
+The dollar fell 19.4% against the shekel over the window (₪3.802 → ₪3.063), so shekel growth is about two
+points a year lower than dollar growth for every mix. The dollar rose in the 2020 and 2022 crashes, so
+falls in shekels were smaller than in dollars, while day-to-day swings were larger. Every row stays within
+the owner's −35% / 4-year tolerance in shekels. 131 of 2,637 sessions had no Bank of Israel rate that day
+and used the last one published before it.
