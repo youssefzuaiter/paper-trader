@@ -11,7 +11,7 @@
 
 # The core's own Alpaca PAPER account number (Account → Overview, "PA…"). Until it is set the
 # core app refuses to start, and the news router refuses to trade this account.
-account = "UNSET"
+account = "PA3EKDCB37WB"
 
 # The evidence this policy rests on: the registration, the run to cite, and the exact registered
 # configuration. The router checks the mix below equals that configuration's weights.
