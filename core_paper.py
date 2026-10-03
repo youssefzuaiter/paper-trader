@@ -18,9 +18,10 @@ import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from decimal import ROUND_DOWN, ROUND_UP, Decimal
 from typing import Any, Final, Protocol
+from zoneinfo import ZoneInfo
 
 import core_alloc
 import tier0_core
@@ -28,6 +29,7 @@ from tier0_core import CorePolicy
 
 CENT: Final[Decimal] = Decimal("0.01")
 QTY: Final[Decimal] = core_alloc.QTY_QUANTUM
+NEW_YORK: Final[ZoneInfo] = ZoneInfo("America/New_York")
 
 
 @dataclass(frozen=True)
@@ -90,9 +92,29 @@ async def read_snapshot(broker: Reads, policy: CorePolicy, session: date, *, for
                     initial=not any(q for q in qty.values()), targets=dict(targets))
 
 
+def last_published(sessions: list[date], now: datetime) -> date | None:
+    """The most recent session whose close the Allocator may read: past, or today once it is 16:20 in New York
+    (the backtest's close + 15 minutes, rounded up to a clock time the Allocator can be scheduled at)."""
+    now_ny = now.astimezone(NEW_YORK)
+    today = now_ny.date()
+    published = [d for d in sorted(sessions) if d < today or (d == today and now_ny.time() >= tier0_core.DECIDE_AFTER)]
+    return published[-1] if published else None
+
+
+def skip_reason(policy: CorePolicy, snap: Snapshot) -> str | None:
+    """Why there can be no plan at all for this close, or None. ``effective_from`` is the first session on
+    which the policy may place an order: a plan that would execute earlier is not made, on either side of the
+    router/Allocator split (both call ``decide``)."""
+    if snap.next_session < policy.effective_from:
+        return f"the policy takes effect {policy.effective_from}; the next session is {snap.next_session}"
+    return None
+
+
 def decide(policy: CorePolicy, snap: Snapshot) -> core_alloc.Plan | None:
     """The plan for this close, or None. The initial build plans fully to the policy mix; afterwards
     ``core_alloc.rebalance_due`` decides, exactly as in the backtest (drift measured with cash in the total)."""
+    if skip_reason(policy, snap) is not None:
+        return None
     targets = dict(policy.mix)
     usable_cash = snap.cash - policy.cash_reserve_usd
     if snap.initial:

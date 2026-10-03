@@ -72,6 +72,19 @@ def default_session(now: datetime) -> date:
     return local.date()
 
 
+async def run(alpaca: Any, http: httpx.AsyncClient, policy: tier0_core.CorePolicy, session: date,
+              secret: str) -> int:
+    """Decide and propose one session; the process's exit status. A weekend or a holiday is not an error, so a
+    daily schedule can simply run this every day."""
+    days = await alpaca.calendar(session.isoformat(), session.isoformat())
+    if not any(date.fromisoformat(d["date"]) == session for d in days):
+        print(json.dumps({"status": "skipped", "reason": f"{session} is not a trading session"}))
+        return 0
+    answer = await propose(alpaca, http, policy, session, secret)
+    print(json.dumps(answer, indent=1, default=str))
+    return 0 if answer["http_status"] == 200 else 1
+
+
 async def main_async(session: date | None) -> int:
     policy = tier0_core.load_policy(Path(os.getenv("CORE_POLICY_PATH", str(DEFAULT_POLICY))))
     problems = tier0_core.violations(policy)
@@ -79,14 +92,18 @@ async def main_async(session: date | None) -> int:
         logger.error("policy outside the tier-0 limits, not proposing: %s", problems)
         return 2
     secret = os.environ["CORE_PLAN_SECRET"]
+    router_url = os.environ["CORE_ROUTER_URL"]
     alpaca = AsyncAlpaca(os.environ["CORE_ALPACA_KEY_ID"], os.environ["CORE_ALPACA_SECRET_KEY"])
     try:
-        async with httpx.AsyncClient(base_url=os.environ["CORE_ROUTER_URL"], timeout=60.0) as http:
-            answer = await propose(alpaca, http, policy, session or default_session(datetime.now(UTC)), secret)
+        async with httpx.AsyncClient(base_url=router_url, timeout=60.0) as http:
+            return await run(alpaca, http, policy, session or default_session(datetime.now(UTC)), secret)
+    except httpx.HTTPError as exc:
+        # The router is down or unreachable: nothing was proposed. The schedule's next attempt can still make
+        # the 09:20 window if it comes before the next morning; say plainly what failed.
+        logger.error("could not reach the core router at %s: %s", router_url, exc)
+        return 1
     finally:
         await alpaca.aclose()
-    print(json.dumps(answer, indent=1, default=str))
-    return 0 if answer["http_status"] == 200 else 1
 
 
 def main(argv: list[str] | None = None) -> int:
