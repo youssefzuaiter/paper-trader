@@ -11,3 +11,6 @@ scikit-learn==1.9.1
 # The backtester's point-in-time store and Parquet cache (backtest/, design D10).
 # Research only: no service image imports it.
 duckdb>=1.1
+
+# Linting in CI (.github/workflows/ci.yml): `ruff check --select F,E9 .`
+ruff>=0.6
