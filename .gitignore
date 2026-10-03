@@ -9,3 +9,7 @@ outbox/
 # Risk & Routing agent state (kill switch, breaker latch) when run locally.
 state/
 .cache/
+# The long-term core's runtime state (core_gatekeeper.py): the plan in flight, the kill switch, and the
+# hash-chained journal of everything it did. It is the record, not source: it lives on the host's volume and
+# is backed up from there, never committed.
+core-state/
