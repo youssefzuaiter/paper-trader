@@ -6,6 +6,7 @@ from __future__ import annotations
 import ast
 import inspect
 import json
+import re
 from dataclasses import replace
 from datetime import UTC, date, datetime, time
 from decimal import Decimal
@@ -30,8 +31,19 @@ SESSIONS = ["2026-09-28", "2026-09-29", "2026-09-30", "2026-10-01", "2026-10-02"
 
 
 def policy(**changes: Any) -> tier0_core.CorePolicy:
-    base = replace(tier0_core.load_policy(POLICY_FILE), account="PA0CORE00001")
+    """The owner's policy with the two values that belong to the owner (the real account number and the
+    start date) replaced, so no test breaks the day either is edited."""
+    base = replace(tier0_core.load_policy(POLICY_FILE), account="PA0CORE00001", effective_from=date(2026, 1, 1))
     return replace(base, **changes)
+
+
+def policy_file(tmp_path: Path, *, account: str = "PA0CORE00001", effective_from: str = "2026-01-01") -> Path:
+    """The same, as a file for the code that loads one: only ``account`` and ``effective_from`` are replaced."""
+    text = re.sub(r'(?m)^account = ".*"$', f'account = "{account}"', POLICY_FILE.read_text())
+    text = re.sub(r'(?m)^effective_from = ".*"$', f'effective_from = "{effective_from}"', text)
+    path = tmp_path / "core.toml"
+    path.write_text(text)
+    return path
 
 
 class FakeBroker:
@@ -125,11 +137,19 @@ async def proposal(router: CoreRouter, session: str) -> dict[str, Any]:
 
 # --- the policy and its limits ------------------------------------------------------------------------------
 
-def test_the_owners_policy_parses_and_fails_closed_until_the_account_is_set() -> None:
+def test_the_committed_policy_is_inside_every_tier0_limit() -> None:
+    """A committed policy that breaks a ceiling would disable trading at start-up; catch it here instead."""
     raw = tier0_core.load_policy(POLICY_FILE)
-    assert tier0_core.violations(raw) == ["account is not set to a paper account number (PA…)"]
-    assert tier0_core.violations(policy()) == []
+    assert tier0_core.violations(raw) == []
     assert raw.rule.name == "quarterly" and raw.buffer_symbol == "BIL" and sum(raw.mix.values()) == 1
+
+
+def test_an_unset_or_malformed_account_fails_closed() -> None:
+    raw = tier0_core.load_policy(POLICY_FILE)
+    expected = ["account is not set to a paper account number (PA…)"]
+    assert tier0_core.violations(replace(raw, account="UNSET")) == expected
+    assert tier0_core.violations(replace(raw, account="")) == expected
+    assert tier0_core.violations(replace(raw, account="AB123")) == expected
 
 
 def test_the_policy_is_the_registered_evidence() -> None:
@@ -355,12 +375,18 @@ async def test_the_router_refuses_any_account_but_the_policys(tmp_path: Path) ->
 @pytest.mark.asyncio
 async def test_the_news_router_refuses_the_core_account(tmp_path: Path) -> None:
     from risk_router.app import CoreAccountRefused, refuse_core_account
-    path = tmp_path / "core.toml"
-    path.write_text(POLICY_FILE.read_text().replace('account = "UNSET"', 'account = "PA0CORE00001"'))
+    path = policy_file(tmp_path)
     with pytest.raises(CoreAccountRefused):
         await refuse_core_account(FakeBroker(), path)
     await refuse_core_account(FakeBroker(account="PA0NEWS00002"), path)
-    await refuse_core_account(FakeBroker(), POLICY_FILE)  # core account not set yet: nothing to refuse
+    # The committed policy names the real core account: the news router must refuse exactly that one.
+    real = tier0_core.load_policy(POLICY_FILE).account
+    with pytest.raises(CoreAccountRefused):
+        await refuse_core_account(FakeBroker(account=real), POLICY_FILE)
+    await refuse_core_account(FakeBroker(account="PA0NEWS00002"), POLICY_FILE)
+    (tmp_path / "unset").mkdir()
+    unset = policy_file(tmp_path / "unset", account="UNSET")
+    await refuse_core_account(FakeBroker(), unset)  # core account not set yet: nothing to refuse
 
 
 @pytest.mark.asyncio
@@ -408,7 +434,8 @@ def test_the_app_fails_closed_until_the_account_is_set_and_halt_still_works(tmp_
     monkeypatch.setenv("CORE_PLAN_SECRET", plan_secret)
     monkeypatch.setenv("WEBHOOK_SECRET", control_secret)
     monkeypatch.setenv("WEBHOOK_URL", "https://example.invalid/receipts")
-    app = create_core_app(alpaca=FakeBroker(), background=False, state_dir=tmp_path, policy_path=POLICY_FILE)
+    app = create_core_app(alpaca=FakeBroker(), background=False, state_dir=tmp_path,
+                          policy_path=policy_file(tmp_path, account="UNSET"))
     with TestClient(app) as client:
         health = client.get("/health").json()
         assert health["trading_enabled"] is False and "account is not set" in health["disabled_reason"]
@@ -428,8 +455,7 @@ async def test_the_allocators_signed_proposal_is_admitted_by_the_router(tmp_path
     from swarm.core_allocator import propose
     secret = "p" * 40
     monkeypatch.setenv("CORE_PLAN_SECRET", secret)
-    path = tmp_path / "core.toml"
-    path.write_text(POLICY_FILE.read_text().replace('account = "UNSET"', 'account = "PA0CORE00001"'))
+    path = policy_file(tmp_path)
     broker = FakeBroker()
     app = create_core_app(alpaca=broker, background=False, state_dir=tmp_path, policy_path=path)
     async with app.router.lifespan_context(app):
