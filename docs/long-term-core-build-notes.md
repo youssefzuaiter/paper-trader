@@ -77,3 +77,40 @@ rounding only (CAGRs within 0.01 point); the only verdict that changes is M1's, 
 this history" under every rule. All other R2 and R3 verdicts, and sections 1 and 2, are unchanged. Both
 runs stay in the registry; this one is the one to cite. R1's missing materiality threshold remains a
 flaw of the registration, now without a visible symptom.
+
+## Paper-mode hardening (2026-10-03)
+
+A review of the paper-mode branch (read-only first, then reproduced against the real router) found one design
+fact that no test could have found and several implementation defects. The full table is in
+`docs/core-paper-mode.md`; what is worth recording here is why they were not caught earlier.
+
+- **The state machine had a way to end that nobody had written down.** The plan's states were designed for the
+  paths that end (`done`, `expired`, `deferred`, `halted`). A process that dies between the sells and the buys has
+  no path to any of them, so the plan sat in `selling` for ever and the cash with it. The fix is not a special case:
+  `reconcile()` states the rule once (a plan that can no longer finish is closed, and re-decided at the next close),
+  and every entry point runs it first.
+- **The breaker cannot see the open from before the open.** The design's "deferred whole, exactly as the backtest
+  models" assumed the check at 09:20-09:27 sees the day's gap. It sees the last close, so it never trips there; it
+  trips only when the buys go in after the sells fill, and then it raised out of the loop every 15 seconds. The
+  behaviour is now handled (abandon, re-decide) and the difference from the backtest is documented rather than
+  claimed away. It is not material to the registered conclusions (it needs a quarter-end that also gaps down 2.5%),
+  but a documented difference is cheap and an undocumented one is how evidence stops meaning what it says.
+- **A control that is parsed but never read looks exactly like one that works.** `effective_from` was in the policy,
+  the docs and the tests' fixtures, and nothing consulted it. The repair is a test that fails when it is ignored.
+- **The branch went red on the commit that made it real.** Setting the real account number broke four tests that
+  had pinned the placeholder, and the repository had no CI to say so. The tests no longer depend on either
+  owner-owned value (account, start date), the committed policy is itself checked against the hard limits, and the
+  repository now has a workflow (`.github/workflows/ci.yml`).
+- **R1's missing materiality threshold is closed for new evidence, not for old.** The registered rule cannot change
+  after its results; rule P4 of the paper-period report (`backtest/paper_report.py`) applies the threshold the notes
+  above called for, to evidence gathered from now on.
+
+- **The strongest evidence that paper mode is the evidence's arithmetic is a replay, not a review.**
+  `tests/test_core_replay.py` drives the real router through 501 real sessions and compares it with the registered
+  engine: 6e-6 of the portfolio at worst, the same 8 trading days. Three broken variants were run against it to show
+  it can fail (monthly rule: 38 bp; two weights tilted a point: 9 bp) and that it tolerates a harmless one (a $1
+  reserve: 0.2 bp). It exercises the quarter-end rule against a real calendar with holidays, which no fixture does.
+
+What this pass could not do, and says so: no order has been placed, so fills, the opening-print behaviour and alert
+delivery are unobserved; the image was built and smoke-tested but not run on a host. Semgrep (1.174.0) and Gitleaks
+(v8.30.1), pinned as in CI, were run on the final tree and found nothing.
