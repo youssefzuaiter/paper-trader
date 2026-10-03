@@ -579,3 +579,18 @@ async def test_a_second_router_on_the_same_state_directory_refuses_to_trade(
     third = create_core_app(alpaca=FakeBroker(), background=False, state_dir=tmp_path, policy_path=path)
     async with third.router.lifespan_context(third):
         assert third.state.disabled is None, "the lock is released when the first router stops"
+
+
+@pytest.mark.asyncio
+async def test_the_reason_trading_is_disabled_has_no_stray_newline(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Alpaca's error bodies end in a newline; it showed up in /health and the pre-flight when a key was rejected."""
+    from risk_router.core_app import create_core_app
+
+    class Rejected(FakeBroker):
+        async def account(self) -> dict[str, Any]:
+            raise AlpacaError('GET /v2/account → HTTP 401: {"message": "unauthorized."}\n', status_code=401)
+
+    monkeypatch.setenv("CORE_PLAN_SECRET", "p" * 40)
+    app = create_core_app(alpaca=Rejected(), background=False, state_dir=tmp_path, policy_path=policy_file(tmp_path))
+    async with app.router.lifespan_context(app):
+        assert app.state.disabled == 'GET /v2/account → HTTP 401: {"message": "unauthorized."}'

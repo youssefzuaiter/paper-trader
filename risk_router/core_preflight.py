@@ -138,7 +138,7 @@ async def run_checks(broker: Any, policy: tier0_core.CorePolicy, *, env: Mapping
         await _network(checks, broker, policy, now)
     except (AlpacaError, OSError, httpx.HTTPError) as exc:
         hint = " The key or secret is wrong, or revoked." if getattr(exc, "status_code", None) in (401, 403) else ""
-        checks.append(Check("alpaca", FAIL, f"an Alpaca call failed: {exc}.{hint}"))
+        checks.append(Check("alpaca", FAIL, f"an Alpaca call failed: {str(exc).strip()}.{hint}"))
     return checks
 
 

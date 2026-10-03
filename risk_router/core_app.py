@@ -289,7 +289,7 @@ def create_core_app(*, alpaca: Any = None, background: bool = True, state_dir: P
             if background:
                 task = asyncio.create_task(_loop(router))
         except (tier0_core.PolicyError, PlanRejected, AlpacaError, OSError) as exc:
-            app.state.disabled = str(exc)
+            app.state.disabled = str(exc).strip()      # Alpaca's error bodies end in a newline
             logger.critical("CORE TRADING DISABLED: %s", exc)
         yield
         if task is not None:
