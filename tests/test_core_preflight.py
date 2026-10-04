@@ -114,6 +114,24 @@ async def test_a_missing_alert_webhook_is_advice_not_a_blocker(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
+async def test_the_website_mirror_is_optional_and_a_mistake_in_it_is_advice_not_a_blocker(tmp_path: Path) -> None:
+    unset = by_name(await preflight(tmp_path))
+    assert unset["website mirror"].status == PASS and "optional" in unset["website mirror"].detail
+
+    url = "https://pfw.example/api/webhooks/core"
+    good = by_name(await preflight(tmp_path, env={**GOOD_ENV, "CORE_PFW_SYNC_URL": url}))
+    assert good["website mirror"].status == PASS and url in good["website mirror"].detail
+
+    plain = by_name(await preflight(tmp_path, env={**GOOD_ENV, "CORE_PFW_SYNC_URL": "http://pfw.example/api/webhooks/core"}))
+    assert plain["website mirror"].status == WARN and "https" in plain["website mirror"].detail
+    assert "NOT READY" not in render(list(plain.values()))        # advice: it cannot stop the core trading
+
+    weak = by_name(await preflight(tmp_path, env={**GOOD_ENV, "CORE_PFW_SYNC_URL": url, "WEBHOOK_SECRET": "short"}))
+    assert weak["website mirror"].status == WARN and "WEBHOOK_SECRET" in weak["website mirror"].detail
+    assert "short" not in weak["website mirror"].detail.replace("shorter", "")     # names the variable, never the value
+
+
+@pytest.mark.asyncio
 async def test_a_policy_that_starts_after_the_next_session_is_flagged(tmp_path: Path) -> None:
     pol = replace(policy(), effective_from=date(2026, 10, 5))
     checks = by_name(await preflight(tmp_path, pol=pol))

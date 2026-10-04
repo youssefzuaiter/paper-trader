@@ -30,6 +30,7 @@ import httpx
 
 import core_paper
 import tier0_core
+from risk_router import core_sync
 from risk_router.alpaca_async import AlpacaError, AsyncAlpaca
 from risk_router.core_gatekeeper import CoreStore, Journal
 from risk_router.state import StateStore
@@ -81,6 +82,20 @@ def _secrets(env: Mapping[str, str]) -> list[Check]:
     return out
 
 
+def _website_mirror(env: Mapping[str, str]) -> Check:
+    """The optional mirror to the owner's website. Never a FAIL: it cannot stop the core trading, so a mistake in it
+    is advice, not a blocker."""
+    try:
+        settings = core_sync.SyncSettings.from_env(env)
+    except core_sync.SyncConfigError as exc:
+        return Check("website mirror", WARN, f"{exc}. Trading is unaffected; the website will show nothing until it "
+                                             f"is fixed")
+    if settings is None:
+        return Check("website mirror", PASS, "not configured (optional): set CORE_PFW_SYNC_URL to watch the core on "
+                                             "the website")
+    return Check("website mirror", PASS, f"will mirror the journal and status to {settings.display_url()}")
+
+
 def _state(state_dir: Path) -> list[Check]:
     out: list[Check] = []
     probe = state_dir
@@ -130,6 +145,7 @@ async def run_checks(broker: Any, policy: tier0_core.CorePolicy, *, env: Mapping
                         f"inside every tier-0 limit · rule {policy.rule.name} · sha256 {policy.sha256[:12]}… · "
                         f"effective {policy.effective_from}"))
     checks.extend(_secrets(env))
+    checks.append(_website_mirror(env))
     checks.extend(_state(state_dir))
     if any(c.status == FAIL and c.name == "alpaca keys" for c in checks):
         return checks                                   # nothing below can run without the keys

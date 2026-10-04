@@ -9,7 +9,7 @@ Route                                Auth        Does
 ``POST /v1/core/plans/{id}/approve`` control     the owner's approval (``fund`` for the build)
 ``POST /v1/core/raise-cash``         control     the owner's "raise X by date": a plan to approve
 ``POST /v1/control/halt``            control     kill switch + cancel open orders
-``GET  /health``                     none        status, policy hash, why trading is disabled
+``GET  /health``                     none        status, policy hash, why trading is disabled, the website mirror
 ===================================  ==========  ==========================================
 
 The Allocator signs with ``CORE_PLAN_SECRET``; the owner's control calls with PFW's existing
@@ -42,6 +42,7 @@ except ImportError:      # not POSIX: no single-instance lock; the deployment ta
     fcntl = None  # type: ignore[assignment]
 
 import tier0_core
+from risk_router import core_sync
 from risk_router.alpaca_async import AlpacaError, AsyncAlpaca
 from risk_router.app import _hmac_dependency, verify_control_signature
 from risk_router.core_alerts import Alerter
@@ -171,15 +172,21 @@ async def halt(request: Request) -> dict[str, Any]:
     return {"halted": True, "orders_canceled": canceled}
 
 
-def _attention(request: Request) -> list[str]:
-    """Everything about this process that a person should look at; empty means all is well."""
-    state = request.app.state
+def _attention(state: Any) -> list[str]:
+    """Everything about this process that a person should look at; empty means all is well. Takes the app's state
+    rather than a request so the website mirror (``core_sync``) can report exactly what ``/health`` says."""
     guard: ExecutionGuard = state.guard
     out: list[str] = []
     if state.disabled:
         out.append(f"trading is disabled: {state.disabled}")
     if guard.state.halted:
         out.append(f"the kill switch is on: {guard.state.halt_reason}")
+    sync_problem = getattr(state, "pfw_sync_error", None)
+    if sync_problem:
+        out.append(f"the website mirror is misconfigured: {sync_problem}")
+    sync: core_sync.CoreSync | None = getattr(state, "pfw_sync", None)
+    if sync is not None and (stalled := sync.attention()):
+        out.append(stalled)
     router: CoreRouter | None = getattr(state, "router", None)
     if router is None:
         return out
@@ -199,16 +206,17 @@ def _attention(request: Request) -> list[str]:
     return out
 
 
-@ops_routes.get("/health")
-async def health(request: Request) -> dict[str, Any]:
-    policy = request.app.state.policy
-    guard: ExecutionGuard = request.app.state.guard
-    router: CoreRouter | None = getattr(request.app.state, "router", None)
+def health_payload(state: Any) -> dict[str, Any]:
+    """What ``GET /health`` answers, and what the website mirror reports as the router's status."""
+    policy = state.policy
+    guard: ExecutionGuard = state.guard
+    router: CoreRouter | None = getattr(state, "router", None)
     plan = router.store.data.plan if router else None
     detail = router.health() if router else None
-    attention = _attention(request)
+    attention = _attention(state)
+    sync: core_sync.CoreSync | None = getattr(state, "pfw_sync", None)
     return {"status": "ok" if not attention else "attention", "environment": "paper", "mode": "core",
-            "trading_enabled": not request.app.state.disabled, "disabled_reason": request.app.state.disabled,
+            "trading_enabled": not state.disabled, "disabled_reason": state.disabled,
             "halted": guard.state.halted, "halt_reason": guard.state.halt_reason,
             "policy_sha256": policy.sha256 if policy else None,
             "policy_effective_from": policy.effective_from.isoformat() if policy else None,
@@ -216,10 +224,16 @@ async def health(request: Request) -> dict[str, Any]:
             "journal": detail and detail["journal"],
             "tick": detail and {"last_age_seconds": detail["last_tick_age_seconds"], "failures": detail["tick_failures"]},
             "attention": attention,
+            "pfw_sync": sync.health() if sync is not None else {"enabled": False},
             "limits": {"max_turnover_pct_per_rebalance": str(tier0_core.MAX_TURNOVER_PER_REBALANCE_PCT),
                        "max_order_notional_usd": str(tier0_core.MAX_ORDER_NOTIONAL_USD),
                        "max_rebalance_plans_per_month": tier0_core.MAX_REBALANCE_PLANS_PER_MONTH,
                        "limit_collar_pct": str(tier0_core.LIMIT_COLLAR_PCT), "exits": "none"}}
+
+
+@ops_routes.get("/health")
+async def health(request: Request) -> dict[str, Any]:
+    return health_payload(request.app.state)
 
 
 async def _loop(router: CoreRouter) -> None:
@@ -252,8 +266,9 @@ def _take_instance_lock(root: Path) -> Any:
 
 def create_core_app(*, alpaca: Any = None, background: bool = True, state_dir: Path | None = None,
                     policy_path: Path | None = None, now: Callable[[], datetime] | None = None,
-                    alerter: Alerter | None = None) -> FastAPI:
-    """``now`` and ``alerter`` exist for tests; production passes neither (real clock, alerts from the env)."""
+                    alerter: Alerter | None = None, pfw_sync: core_sync.CoreSync | None = None) -> FastAPI:
+    """``now``, ``alerter`` and ``pfw_sync`` exist for tests; production passes none (real clock, alerts and the
+    website mirror configured from the environment)."""
     clock = now or (lambda: datetime.now(UTC))
 
     @asynccontextmanager
@@ -291,10 +306,31 @@ def create_core_app(*, alpaca: Any = None, background: bool = True, state_dir: P
         except (tier0_core.PolicyError, PlanRejected, AlpacaError, OSError) as exc:
             app.state.disabled = str(exc).strip()      # Alpaca's error bodies end in a newline
             logger.critical("CORE TRADING DISABLED: %s", exc)
+
+        # The website mirror (core_sync): read-only, optional, and a task of its own, so nothing it does can reach
+        # the execution loop above. Started whether or not trading is enabled, because a router that cannot trade
+        # is exactly when the owner most wants to see why. A router that lost the single-instance lock is not the
+        # one writing the journal, so it does not mirror it.
+        app.state.pfw_sync = None
+        app.state.pfw_sync_error = None
+        sync_task = None
+        if background and instance_lock is not None:
+            try:
+                sync = pfw_sync or core_sync.CoreSync.from_env(
+                    journal_path=root / core_sync.JOURNAL_FILE, state_path=root / core_sync.STATE_FILE,
+                    status=lambda: health_payload(app.state), broker=app.state.alpaca, policy=app.state.policy)
+            except core_sync.SyncConfigError as exc:
+                app.state.pfw_sync_error = str(exc)
+                logger.error("core sync NOT started: %s", exc)
+                sync = None
+            if sync is not None:
+                app.state.pfw_sync = sync
+                sync_task = asyncio.create_task(sync.run_forever())
         yield
-        if task is not None:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+        running = [t for t in (task, sync_task) if t is not None]
+        for t in running:
+            t.cancel()
+        await asyncio.gather(*running, return_exceptions=True)
         if instance_lock is not None:
             instance_lock.close()                        # closing the file releases the lock
         if alpaca is None:
