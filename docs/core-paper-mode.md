@@ -20,6 +20,7 @@ system design PDF §3 and §7 · **Operating it:** `docs/core-runbook.md`
 | Console | `risk_router/core_ctl.py` | no (asks the router) | The owner's signed `status` / `approve` / `raise-cash` / `halt` |
 | Pre-flight | `risk_router/core_preflight.py` | no | Read-only readiness check, and a dry run of the Allocator |
 | Paper report | `backtest/paper_report.py` | no | Turns the journal into the out-of-sample evidence the design promised, under rules fixed before any order |
+| Website mirror | `risk_router/core_sync.py` | no (read-only) | Optional. Copies the journal and the router's status to the PFW website so the owner can watch the core there; sends from a cursor over the journal, never writes it, can never reach the execution loop |
 
 The news router (`risk_router/app.py`, `tier0.py`) is unchanged except for one refusal: it will not
 start on the core's account.
@@ -115,7 +116,10 @@ test), then fixed:
 ## Open items
 
 - **Receipts to PFW are off** (`receipts_to_pfw = false`). PFW's ledger has no notion of a second account,
-  and the core's fills would mix with the news account's. The journal is the record until PFW is ready.
+  and the core's fills would mix with the news account's. The journal is the record. What PFW gets instead is the
+  **mirror** (`core_sync`, optional, `CORE_PFW_SYNC_URL`): a read-only copy of the journal, status and account in
+  tables of their own, shown at `/trading/core` and never part of PFW's ledger or net worth. It is not a receipt
+  feed and does not change this flag.
 - **No order has been placed.** Everything above is verified against fakes and, for the read-only paths, the real
   paper API. Fills, the opening-print behaviour and alert delivery are first seen on the first funded session.
 - **Hosting is undecided.** The image builds and was smoke-tested locally on 2026-10-03: it starts as a non-root
