@@ -15,6 +15,7 @@ says what you *do* with them.
 | **Console** `risk_router.core_ctl` | When something needs you: `status`, `approve`, `raise-cash`, `halt`, `test-alert`. | answer it |
 | **Preflight** `risk_router.core_preflight` | Before the first evening, and after any change to keys, policy or host. Read-only. | run it |
 | **Report** `backtest.paper_report` | Monthly. Read-only. | read it |
+| **Website mirror** `risk_router.core_sync` | Inside the router, if `CORE_PFW_SYNC_URL` is set. Read-only. | watch `/trading/core` |
 
 Raising cash (`core_ctl raise-cash`) must be asked **after 16:20 New York**: the plan is decided on a published close
 and executes at the next open, so asked during the session it would aim at an open that has already passed, and the
@@ -49,6 +50,26 @@ New York 09:20–09:27 is 16:20–16:27 in UTC+3 while New York is on daylight t
 7. **Schedule the Allocator** after 16:20 New York. A UTC schedule that is right all year is 21:30 (that is 17:30
    in summer and 16:30 in winter in New York; the Allocator refuses to run before 16:20 there):
    `30 21 * * 1-5  cd /path/to/paper-trader && ./.venv/bin/python -m swarm.core_allocator >> core-state/allocator.log 2>&1`
+
+## Watching it on the website (optional)
+
+PFW (the website) can show the core: its status, account, holdings against target, the open plan, plan history and
+the journal. It is **read-only**: it cannot approve, halt or trade, because the website holds no credential for the
+router. Approving a plan is still `core_ctl approve`, from the router's host.
+
+1. In PFW's deployment, `PAPER_TRADING_USER_EMAIL` must name the account that should see the core (it already does,
+   for the trading agent), and the migration `core_agent_mirror` must be applied.
+2. In this repository's `.env`: `CORE_PFW_SYNC_URL=https://<your PFW domain>/api/webhooks/core`. It is signed with
+   `WEBHOOK_SECRET`, the same value PFW already holds for the trade receipts. `core_preflight` checks the setting
+   (`website mirror`) and never blocks on it.
+3. Start the router. Within a minute the website shows the journal; within five, the router's status; within the
+   hour, the account. `GET /health` shows the mirror under `pfw_sync` (`last_success_at`, `pending_entries`,
+   `last_error`).
+
+How it works, in one paragraph: the router sends from a cursor over its own journal and moves it only when PFW says it
+holds the entries, so there is no second queue to lose, and a website that is down just means "send again later". The
+cursor lives in `core-sync-state.json` beside the journal; losing it is harmless. A copy of the journal on the website
+re-checks its own hash chain on every page load.
 
 ## The first run
 
@@ -85,6 +106,7 @@ New York 09:20–09:27 is 16:20–16:27 in UTC+3 while New York is on daylight t
 | **The router disagrees with the Allocator** (`plan_mismatch`) | Two programs computed different plans from what should be identical inputs. | **Stop and look.** Approve nothing. Usually the account or the bars changed between the two reads: run the Allocator once more. If it persists, the two hosts run different code: compare versions. |
 | **A plan broke a limit** | The hard limits refused it (e.g. turnover over 25%). | A rebalance that large means a position changed by hand or something is badly wrong. There is no override, on purpose. Find out why before touching the limits. |
 | **The execution loop keeps failing** | Three ticks in a row (45 s) failed; repeats hourly. | Check Alpaca's status and the host's log. Orders are at-most-once by client id, so retries are safe. |
+| **The website mirror has not updated for 30 minutes** | `GET /health` lists it under `attention`; `pfw_sync.last_error` says why. `HTTP 403`: `WEBHOOK_SECRET` differs between here and PFW. `HTTP 503 paper_trading_user_unresolved`: PFW's `PAPER_TRADING_USER_EMAIL` matches no user. `HTTP 503 core_mirror_unavailable`: PFW's `core_agent_mirror` migration has not been applied. `HTTP 404`: PFW has not deployed the route yet. `chain_conflict`: PFW holds a different history for an entry (the journal was restored from an older copy, or PFW's data was changed). | Trading is unaffected, and nothing is lost: the journal is the outbox. Fix the cause and it catches up by itself. For `chain_conflict`, compare `core-state/core-journal.jsonl` with the website's journal before changing anything. |
 | **The journal failed its integrity check** | An entry was altered, removed, or the files are from different times. **Trading is disabled until this is resolved.** | **Do not delete anything.** Copy `core-state/` aside, compare with your backup, and see whether the damage is the last entry (a restore fixes it) or the middle (investigate). |
 
 **The kill switch:** `core_ctl halt` stops all core trading and cancels open orders. It survives restarts. To resume,

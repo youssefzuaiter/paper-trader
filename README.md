@@ -61,7 +61,7 @@ Paper keys: <https://app.alpaca.markets/paper/dashboard/overview> → *API Keys*
 | `core_paper.py` | core | The paper-mode decision shared by the Allocator and the core router (snapshot, plan, order payloads). |
 | `tier0_core.py` | core | The core's hard limits and the policy file's validation. |
 | `policy/core.toml` | core | The owner's policy: mix, rule, limits, first tradable session. Changed only by a reviewed commit. |
-| `risk_router/core_*.py` | core | The core router (`core_app`, `core_gatekeeper`), alerts, the owner's console (`core_ctl`) and the read-only pre-flight (`core_preflight`). |
+| `risk_router/core_*.py` | core | The core router (`core_app`, `core_gatekeeper`), alerts, the owner's console (`core_ctl`), the read-only pre-flight (`core_preflight`) and the read-only mirror to the PFW website (`core_sync`). |
 | `swarm/core_allocator.py` | core | The Allocator: after each close, proposes; cannot trade. |
 | `backtest/` | research | The point-in-time backtester and the core's registered study; `backtest/paper_report.py` turns the paper journal into evidence. |
 
@@ -149,6 +149,9 @@ diversified mix with discipline. Nothing in its decision is learned.
   enforces hard ceilings the owner's policy cannot exceed, needs the owner's signed approval for the initial build and
   any large or raise-cash plan, and closes every plan one way or another (a process that dies mid-rebalance cannot
   strand the cash). The journal is hash-chained and checked at start-up.
+* **Watching it:** with `CORE_PFW_SYNC_URL` set, the router mirrors its journal and status to the PFW website
+  (`/trading/core`): read-only, signed, and sent from a cursor over the journal itself, so nothing is lost while the
+  site is down. PFW can show the core and cannot steer it.
 * **Operating it:** `docs/core-runbook.md`. Design and status: `docs/core-paper-mode.md`.
 
 ```bash
