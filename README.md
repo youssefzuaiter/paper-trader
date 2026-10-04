@@ -4,6 +4,18 @@ Sandbox-only equities agent. Sentiment inference gated by a deterministic
 execution layer, with HMAC-signed trade receipts pushed to the PFW Next.js
 dashboard.
 
+> **This repository holds two independent systems, on two separate Alpaca paper accounts.**
+>
+> | | News agent (most of this README) | Long-term core ([below](#the-long-term-core)) |
+> |---|---|---|
+> | Idea | Trade headlines intraday; every position closed by the session's end | Hold a diversified ETF mix for years and rebalance it by a fixed rule |
+> | Decides with | FinBERT sentiment + a return model + hard Tier-0 limits | Nothing learned: fixed weights and a calendar rule, chosen from a pre-registered backtest |
+> | Evidence | The swarm's own finding: no edge out of sample (test AUC ≈ 0.52) | `docs/long-term-core-design.md`, run `x-20261001-121225-9c4ebec5`, 12 leakage checks with broken twins |
+> | State | Live on Render, receipts to PFW | Built, tested, **not deployed**; its journal is the record |
+>
+> They never share an account: the news router will not start on the core's account, and the core router will not
+> start on any other.
+
 **Nothing here can touch real money.** `broker.py` hardcodes `paper=True` as a
 module-level `Final`, and re-asserts after construction that the resolved client
 points at `https://paper-api.alpaca.markets` with `sandbox=True`. There is no
@@ -45,6 +57,13 @@ Paper keys: <https://app.alpaca.markets/paper/dashboard/overview> → *API Keys*
 | `risk_router/` | — | The Risk & Routing agent: the swarm's gatekeeper. See below. |
 | `swarm/`       | — | Ingestion, Quantitative and Inference agents, plus offline training of the return model. See below. |
 | `finbert_onnx.py` | — | FinBERT int8 ONNX loader without torch, shared by `inference.py` and the Inference Agent. |
+| `core_alloc.py` | core | The long-term core's allocation rules and arithmetic: the one copy the backtest and paper trading share. Pure stdlib. |
+| `core_paper.py` | core | The paper-mode decision shared by the Allocator and the core router (snapshot, plan, order payloads). |
+| `tier0_core.py` | core | The core's hard limits and the policy file's validation. |
+| `policy/core.toml` | core | The owner's policy: mix, rule, limits, first tradable session. Changed only by a reviewed commit. |
+| `risk_router/core_*.py` | core | The core router (`core_app`, `core_gatekeeper`), alerts, the owner's console (`core_ctl`) and the read-only pre-flight (`core_preflight`). |
+| `swarm/core_allocator.py` | core | The Allocator: after each close, proposes; cannot trade. |
+| `backtest/` | research | The point-in-time backtester and the core's registered study; `backtest/paper_report.py` turns the paper journal into evidence. |
 
 ---
 
@@ -113,6 +132,35 @@ functions the live agents use; tests check that they stay identical.
 
 `ORDERS_VIA_RISK_ROUTER=true` retires this service's own order placement
 once the router is live (see the migration plan).
+
+---
+
+## The long-term core
+
+A second, independent system: a $10,000 paper portfolio of broad ETFs (US stocks, international stocks, bonds,
+gold, real estate and a 5% T-bill buffer), rebalanced on the last session of each quarter. It exists because the
+news agent's own evidence says the intraday signal is noise; the honest alternative is to stop predicting and hold a
+diversified mix with discipline. Nothing in its decision is learned.
+
+* **Evidence before code.** The grid, the windows, the cost levels and the reading rules were registered before any
+  result existed (`docs/long-term-core-design.md`, `docs/long-term-core-build-notes.md`); twelve leakage and consistency
+  checks each have a deliberately broken twin that must fail; a registered run reproduces to the same report hash.
+* **Safety.** The Allocator can only *propose*. The router recomputes every plan itself and rejects any difference,
+  enforces hard ceilings the owner's policy cannot exceed, needs the owner's signed approval for the initial build and
+  any large or raise-cash plan, and closes every plan one way or another (a process that dies mid-rebalance cannot
+  strand the cash). The journal is hash-chained and checked at start-up.
+* **Operating it:** `docs/core-runbook.md`. Design and status: `docs/core-paper-mode.md`.
+
+```bash
+./.venv/bin/python -m risk_router.core_preflight     # read-only: is everything ready? what would the first plan be?
+./.venv/bin/python -m risk_router.core_ctl status    # also: approve [--fund], raise-cash, halt, test-alert
+./.venv/bin/python -m swarm.core_allocator           # once per session, after 16:20 New York
+./.venv/bin/python -m backtest.paper_report          # monthly: the out-of-sample evidence
+uvicorn risk_router.core_app:create_core_app --factory --port 8080
+```
+
+`docker build -f Dockerfile.core -t paper-trader/core .` builds the router, Allocator and console in one image
+(smoke-tested locally on 2026-10-03: it builds, runs as a non-root user and fails closed on a key Alpaca rejects; it has not been run on a host).
 
 ---
 

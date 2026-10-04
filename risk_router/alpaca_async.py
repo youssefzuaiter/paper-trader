@@ -161,6 +161,25 @@ class AsyncAlpaca:
             )
         return response.json(parse_float=Decimal)
 
+    async def daily_bars(self, symbols: list[str], start: str, end: str) -> dict[str, list[dict[str, Any]]]:
+        """Raw (unadjusted) daily SIP bars per symbol, oldest first: the prices that actually traded.
+        Read-only; the long-term core's Allocator and router value positions with them."""
+        params: dict[str, Any] = {"symbols": ",".join(symbols), "timeframe": "1Day", "start": start, "end": end,
+                                  "adjustment": "raw", "feed": "sip", "limit": 10_000, "sort": "asc"}
+        out: dict[str, list[dict[str, Any]]] = {s: [] for s in symbols}
+        while True:
+            body = await self._get(self._data, "/v2/stocks/bars", params)
+            for symbol, bars in (body.get("bars") or {}).items():
+                out.setdefault(symbol, []).extend(bars)
+            token = body.get("next_page_token")
+            if not token:
+                return out
+            params["page_token"] = token
+
+    async def calendar(self, start: str, end: str) -> list[dict[str, Any]]:
+        """Exchange sessions (New York wall clock), from the paper trading host. Read-only."""
+        return await self._get(self._trading, "/v2/calendar", {"start": start, "end": end})
+
     async def latest_quote(self, symbol: str) -> LatestQuote:
         """Latest IEX quote — the free feed the paper keys already include."""
         body = await self._get(self._data, f"/v2/stocks/{symbol}/quotes/latest", {"feed": "iex"})

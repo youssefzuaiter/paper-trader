@@ -20,6 +20,8 @@ IMAGES = {
     "Dockerfile.router": ["risk_router.app"],
     "Dockerfile.swarm": ["swarm.ingestion", "swarm.quant"],
     "Dockerfile.inference": ["swarm.inference_agent"],
+    "Dockerfile.core": ["risk_router.core_app", "risk_router.core_ctl", "risk_router.core_preflight",
+                        "swarm.core_allocator"],
 }
 
 

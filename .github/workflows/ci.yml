@@ -1,0 +1,92 @@
+name: CI
+
+# This repository places (paper) orders and holds broker credentials in its environment, so it gets the same gates
+# the PFW app has: the whole test suite on every push and pull request, and two secret/static scans. It had none,
+# which is how a branch went red on the commit that set the real account number and nothing said so.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: pytest + ruff
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      # requirements.txt resolves the CPU-only torch wheel on Linux (see the note there); nothing here needs a GPU.
+      - name: Install dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      # F = pyflakes (unused imports, undefined names), E9 = syntax errors: the errors that are bugs. Style rules
+      # are deliberately not gated; the codebase is not clean under them and a style gate would only add noise.
+      - name: Lint (real errors only)
+        run: ruff check --select F,E9 .
+
+      # The tests marked real_data need the fetched market-data caches under .cache/, which a fresh checkout does
+      # not have; they skip themselves. Everything else runs: the core's router, Allocator, console, pre-flight and
+      # report, the Dockerfiles' file lists, the news agent, the swarm.
+      - name: Run the test suite
+        run: python -m pytest -q
+
+  gitleaks:
+    name: Security · Gitleaks (credential leak scan)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # The same pinned, checksum-verified release PFW's workflow installs, rather than the gitleaks-action
+      # wrapper (which wants a paid licence for non-public repositories; the CLI itself is free).
+      - name: Install Gitleaks (checksum-verified)
+        run: |
+          set -euo pipefail
+          version="8.30.1"
+          archive="gitleaks_${version}_linux_x64.tar.gz"
+          curl -sSfLO "https://github.com/gitleaks/gitleaks/releases/download/v${version}/${archive}"
+          curl -sSfLO "https://github.com/gitleaks/gitleaks/releases/download/v${version}/gitleaks_${version}_checksums.txt"
+          grep " ${archive}\$" "gitleaks_${version}_checksums.txt" | sha256sum -c -
+          tar -xzf "${archive}" gitleaks
+          sudo install -m 0755 gitleaks /usr/local/bin/gitleaks
+
+      # The working tree, not history; --redact keeps a finding's value out of the job log.
+      - name: Scan for leaked credentials
+        run: gitleaks detect --source . --no-git --redact --verbose --exit-code 1
+
+  semgrep:
+    name: Security · Semgrep (static analysis)
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep:1.174.0
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # Public registry rulesets, no token. Only ERROR-severity findings fail the job: the first run of a scanner on
+      # an existing codebase otherwise buries the real ones under advice.
+      - name: Run Semgrep
+        run: >-
+          semgrep scan
+          --config=p/python
+          --config=p/security-audit
+          --config=p/secrets
+          --config=p/owasp-top-ten
+          --severity=ERROR
+          --error
+          --metrics=off

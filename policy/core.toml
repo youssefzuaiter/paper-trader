@@ -1,0 +1,65 @@
+# The long-term core's investment policy: owned by the owner, read-only to every agent.
+#
+# Core design §8.2, reconciled with the system design's §7.1. Changed only by a reviewed commit
+# and a restart; mounted read-only in deployment. Its sha256 is written into every journal
+# entry and receipt, so any change is visible. The router validates it against the hard limits
+# in tier0_core.py at start-up and refuses to trade (fails closed) if anything is out of bounds.
+#
+# Not financial advice: these are the owner's own choices, given 2026-10-02.
+#
+# TOML: every top-level key must come before the first [table]; keys after a header belong to it.
+
+# The core's own Alpaca PAPER account number (Account → Overview, "PA…"). Until it is set the
+# core app refuses to start, and the news router refuses to trade this account.
+account = "PA3EKDCB37WB"
+
+# The evidence this policy rests on: the registration, the run to cite, and the exact registered
+# configuration. The router checks the mix below equals that configuration's weights.
+registration = "x-20261001-112412-3f5633a7"
+evidence_run = "x-20261001-121225-9c4ebec5"
+evidence_config = "buffer:full:M3:quarterly:central:$10000:buffer0.05"
+
+# The first session the policy may trade; set when the account is funded.
+effective_from = "2026-10-05"
+
+# The most that may be put into this account (system design §7.1): checked when the initial build is
+# approved, against the account's cash then. Growth after that is not capped. Create the paper account
+# with a $10,000 starting balance (Alpaca's default is $100,000).
+funded_amount_cap_usd = "10000"
+
+# A plan whose total traded notional exceeds this waits for the owner's signed approval
+# (system design §7.1 "approval_needed_above").
+approval_needed_above_usd = "3000"
+
+# System design §7.4's drawdown ladder (no buying after a deep fall) would block exactly the
+# rebalancing buys the registered backtest assumed in 2020 and 2022, so it is OFF for this policy.
+# Turning it on is the owner's decision and makes paper results diverge from the evidence.
+drawdown_ladder = "off"
+
+# Where alerts go. Fill receipts to PFW stay off until PFW can tell this account from the news one.
+alerts = "journal"
+receipts_to_pfw = false
+
+# M3 with a 5% BIL buffer: 19% each of US stocks, international stocks, bonds, gold and real estate.
+[mix]
+VTI = "0.19"
+VXUS = "0.19"
+BND = "0.19"
+IAU = "0.19"
+VNQ = "0.19"
+BIL = "0.05"
+
+[rule]
+name = "quarterly"          # one of core_alloc.RULES
+
+[buffer]
+symbol = "BIL"
+target = "0.05"
+
+[limits]
+max_order_usd = "5000"                  # one order's notional (hard ceiling: tier0_core)
+max_turnover_pct_per_rebalance = "25"   # one-way, of equity (the initial build needs a signed fund command)
+min_order_usd = "1"                     # Alpaca's fractional minimum
+cash_reserve_usd = "1"
+max_trades_per_week = 20                # system design §7.4 turnover cap
+max_trade_value_pct_per_week = "50"

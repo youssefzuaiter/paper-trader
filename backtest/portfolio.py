@@ -182,11 +182,7 @@ def simulate(prices: Prices, spec: Spec, start: int, end: int, level: CostLevel,
         carried_tax += tax_due
         carried = ZERO
         drift_basis = day.weights if profile.drift_includes_cash else _weights_ex_cash(qty, closes)
-        rule = spec.rule
-        if forced:  # a plan the breaker deferred is re-decided at this close (§3.1 a)
-            due = rule.never or rule.band is None or core_alloc.drift(drift_basis, targets) > rule.band
-        else:
-            due = rule.due(ends, drift_basis, targets)
+        due = core_alloc.rebalance_due(spec.rule, ends, drift_basis, targets, forced=forced)
         forced = False
         if due:
             view = prices.view(k) if spec.needs_view else None

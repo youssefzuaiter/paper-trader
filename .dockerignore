@@ -1,0 +1,17 @@
+# Docker uploads the whole build context to the daemon before any COPY runs. The
+# Dockerfiles copy explicit file lists, so none of this could enter an image, but
+# without this file `docker build .` still sends it all: the venv and the market
+# data caches are ~2 GB, and .env (the broker keys) would leave the directory.
+# Nothing listed here is copied by any Dockerfile.
+.git
+.venv
+.cache
+.env
+.env.*
+core-state
+outbox
+state
+**/__pycache__
+.pytest_cache
+.ruff_cache
+.claude

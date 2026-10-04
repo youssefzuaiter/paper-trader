@@ -1,0 +1,45 @@
+# The long-term core: the router, the Allocator and the owner's console, one image.
+#   docker build -f Dockerfile.core -t paper-trader/core:0.1.0 .
+#
+#   router     (the default)  uvicorn risk_router.core_app:create_core_app --factory --port 8080
+#   allocator  python -m swarm.core_allocator          once per session, after 16:20 New York
+#   console    python -m risk_router.core_ctl status   status / approve / raise-cash / halt
+#   preflight  python -m risk_router.core_preflight    read-only readiness check
+#
+# Copies an explicit file list rather than the build context, so .env, .venv, caches and the other apps' model
+# files can never end up in the image (tests/test_images.py rebuilds this list in a temp directory and imports
+# every entry point from there, so a new import that misses the list fails the suite instead of the pod).
+#
+# policy/core.toml is baked in on purpose: the policy changes by a reviewed commit and a new image, never by
+# editing a file on a running host. The state (the kill switch, the plan, the journal) lives on a volume
+# mounted at /data: without one the journal is lost on every redeploy, which is the one thing that must
+# never happen to the record of what a trading system did.
+FROM python:3.13-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    CORE_STATE_DIR=/data/core-state
+
+WORKDIR /app
+
+COPY risk_router/requirements.txt /tmp/requirements.txt
+RUN pip install -r /tmp/requirements.txt && rm /tmp/requirements.txt
+
+COPY config.py outbox.py tier0.py tier0_core.py core_alloc.py core_paper.py webhook.py ./
+COPY risk_router/ risk_router/
+COPY swarm/__init__.py swarm/core_allocator.py swarm/
+COPY policy/core.toml policy/core.toml
+
+RUN useradd --uid 10001 --no-create-home --shell /usr/sbin/nologin core \
+ && mkdir -p /data/core-state /app/outbox \
+ && chown core /data/core-state /app/outbox
+USER 10001
+
+VOLUME /data
+EXPOSE 8080
+# /health answers 200 whenever the process is up (even when trading is disabled, on purpose: a platform that
+# restarts a deliberately disabled service in a loop helps nobody). Its "attention" list says what needs a person.
+HEALTHCHECK --interval=60s --timeout=5s --start-period=20s \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=4)"
+CMD ["uvicorn", "risk_router.core_app:create_core_app", "--factory", "--host", "0.0.0.0", "--port", "8080", "--no-access-log"]
